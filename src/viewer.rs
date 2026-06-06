@@ -75,6 +75,10 @@ impl ViewerState {
         self.zoom * 100.0
     }
 
+    pub fn effective_image_size_pub(&self, image_size: Vec2) -> Vec2 {
+        self.effective_image_size(image_size)
+    }
+
     fn effective_image_size(&self, image_size: Vec2) -> Vec2 {
         if self.rotation == 90 || self.rotation == 270 {
             Vec2::new(image_size.y, image_size.x)
@@ -228,7 +232,8 @@ impl ViewerState {
         self.selection = None;
     }
 
-    pub fn paint(&mut self, ui: &mut Ui, texture: &TextureHandle, image_size: Vec2) -> Rect {
+    pub fn paint(&mut self, ui: &mut Ui, texture: &TextureHandle, image_size: Vec2) -> (Rect, bool) {
+        let mut zoom_to_sel_requested = false;
         let available = ui.available_size();
 
         let eff_size = self.effective_image_size(image_size);
@@ -324,7 +329,7 @@ impl ViewerState {
             }
         }
 
-        // Draw selection rectangle
+        // Draw selection rectangle + magnifying glass
         if let Some(sel) = &self.selection {
             if sel.is_significant() {
                 let sel_rect = sel.rect();
@@ -336,21 +341,18 @@ impl ViewerState {
                 );
                 // Dim area outside selection
                 let dim = Color32::from_black_alpha(100);
-                // Top
                 if sel_rect.min.y > canvas_rect.min.y {
                     ui.painter().rect_filled(
                         Rect::from_min_max(canvas_rect.min, Pos2::new(canvas_rect.max.x, sel_rect.min.y)),
                         0.0, dim,
                     );
                 }
-                // Bottom
                 if sel_rect.max.y < canvas_rect.max.y {
                     ui.painter().rect_filled(
                         Rect::from_min_max(Pos2::new(canvas_rect.min.x, sel_rect.max.y), canvas_rect.max),
                         0.0, dim,
                     );
                 }
-                // Left
                 ui.painter().rect_filled(
                     Rect::from_min_max(
                         Pos2::new(canvas_rect.min.x, sel_rect.min.y),
@@ -358,7 +360,6 @@ impl ViewerState {
                     ),
                     0.0, dim,
                 );
-                // Right
                 ui.painter().rect_filled(
                     Rect::from_min_max(
                         Pos2::new(sel_rect.max.x, sel_rect.min.y),
@@ -366,9 +367,20 @@ impl ViewerState {
                     ),
                     0.0, dim,
                 );
+
+                // Magnifying glass when hovering inside selection
+                if let Some(hover_pos) = response.hover_pos() {
+                    if sel_rect.contains(hover_pos) && self.drag_start.is_none() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ZoomIn);
+
+                        if response.clicked() {
+                            zoom_to_sel_requested = true;
+                        }
+                    }
+                }
             }
         }
 
-        canvas_rect
+        (canvas_rect, zoom_to_sel_requested)
     }
 }

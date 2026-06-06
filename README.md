@@ -1,6 +1,6 @@
 # Cove Image Viewer
 
-The VLC of image viewers — opens everything.
+The VLC of image viewers — opens every image.
 
 A fast, cross-platform image viewer built in Rust with egui. Single 22 MB binary with zero runtime dependencies. Supports 45+ image formats including HEIC, AVIF, RAW, PSD, SVG, JPEG XL, JPEG 2000, and more.
 

@@ -2,7 +2,7 @@
 name = "cove-image-viewer"
 version = "0.1.0"
 edition = "2021"
-description = "The VLC of image viewers — opens everything"
+description = "The VLC of image viewers — opens every image"
 
 [dependencies]
 eframe = { version = "0.31", features = ["default_fonts", "glow"] }

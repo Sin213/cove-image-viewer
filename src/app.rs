@@ -20,11 +20,15 @@ pub struct CoveApp {
     slideshow_interval: f32,
     slideshow_timer: f32,
     canvas_rect: egui::Rect,
+    current_pixels: Option<egui::ColorImage>,
     lock_zoom: bool,
     always_on_top: bool,
     show_about: bool,
     show_image_info: bool,
     confirm_delete: Option<PathBuf>,
+    pending_crop: bool,
+    pending_undo: bool,
+    undo_stack: Vec<(egui::ColorImage, Vec2)>,
 }
 
 impl CoveApp {
@@ -45,11 +49,15 @@ impl CoveApp {
             slideshow_interval: 5.0,
             slideshow_timer: 0.0,
             canvas_rect: egui::Rect::NOTHING,
+            current_pixels: None,
             lock_zoom: false,
             always_on_top: false,
             show_about: false,
             show_image_info: false,
             confirm_delete: None,
+            pending_crop: false,
+            pending_undo: false,
+            undo_stack: Vec::new(),
         };
 
         if let Some(p) = path {
@@ -92,6 +100,7 @@ impl CoveApp {
                 self.current_file_size = file_size;
                 self.error = None;
                 self.pending_image = Some(decoded);
+                self.undo_stack.clear();
             }
             Err(e) => {
                 self.error = Some((path.to_path_buf(), e));
@@ -123,6 +132,85 @@ impl CoveApp {
             if let Some(path_str) = path.to_str() {
                 let _ = wallpaper::set_from_path(path_str);
             }
+        }
+    }
+
+    fn crop_to_selection(&mut self, ctx: &egui::Context) {
+        let sel = match &self.viewer.selection {
+            Some(s) if s.is_significant() => s.rect(),
+            _ => return,
+        };
+        let pixels = match &self.current_pixels {
+            Some(p) => p,
+            None => return,
+        };
+
+        let orig_w = pixels.width();
+        let orig_h = pixels.height();
+        let eff_size = self.viewer.effective_image_size_pub(self.current_image_size);
+        let scaled = eff_size * self.viewer.zoom;
+        let center = self.canvas_rect.center();
+        let img_min = egui::Pos2::new(
+            center.x - scaled.x * 0.5 + self.viewer.offset.x,
+            center.y - scaled.y * 0.5 + self.viewer.offset.y,
+        );
+
+        let ex1 = ((sel.min.x - img_min.x) / self.viewer.zoom).max(0.0) as usize;
+        let ey1 = ((sel.min.y - img_min.y) / self.viewer.zoom).max(0.0) as usize;
+        let ex2 = ((sel.max.x - img_min.x) / self.viewer.zoom).ceil() as usize;
+        let ey2 = ((sel.max.y - img_min.y) / self.viewer.zoom).ceil() as usize;
+
+        self.undo_stack.push((pixels.clone(), self.current_image_size));
+
+        let transformed = apply_transform(pixels, self.viewer.rotation, self.viewer.flip_h, self.viewer.flip_v);
+        let tw = transformed.width();
+        let th = transformed.height();
+
+        let x1 = ex1.min(tw);
+        let y1 = ey1.min(th);
+        let x2 = ex2.min(tw);
+        let y2 = ey2.min(th);
+        let cw = x2.saturating_sub(x1);
+        let ch = y2.saturating_sub(y1);
+
+        if cw == 0 || ch == 0 {
+            return;
+        }
+
+        let mut cropped_pixels = Vec::with_capacity(cw * ch);
+        for y in y1..y2 {
+            for x in x1..x2 {
+                cropped_pixels.push(transformed.pixels[y * tw + x]);
+            }
+        }
+
+        let cropped = egui::ColorImage {
+            size: [cw, ch],
+            pixels: cropped_pixels,
+        };
+
+        let texture = ctx.load_texture("current_image", cropped.clone(), egui::TextureOptions::LINEAR);
+        self.current_texture = Some(texture);
+        self.current_pixels = Some(cropped);
+        self.current_image_size = Vec2::new(cw as f32, ch as f32);
+        self.viewer.rotation = 0;
+        self.viewer.flip_h = false;
+        self.viewer.flip_v = false;
+        self.viewer.selection = None;
+        self.viewer.set_fit_mode(FitMode::FitWindow);
+    }
+
+    fn undo_crop(&mut self, ctx: &egui::Context) {
+        if let Some((pixels, size)) = self.undo_stack.pop() {
+            let texture = ctx.load_texture("current_image", pixels.clone(), egui::TextureOptions::LINEAR);
+            self.current_texture = Some(texture);
+            self.current_pixels = Some(pixels);
+            self.current_image_size = size;
+            self.viewer.rotation = 0;
+            self.viewer.flip_h = false;
+            self.viewer.flip_v = false;
+            self.viewer.selection = None;
+            self.viewer.set_fit_mode(FitMode::FitWindow);
         }
     }
 
@@ -188,6 +276,7 @@ impl CoveApp {
         let mut crop_to_selection = false;
         let mut copy_to_clip = false;
         let mut delete_file = false;
+        let mut undo = false;
         let mut text_actions: Vec<String> = Vec::new();
 
         ctx.input(|i| {
@@ -227,6 +316,9 @@ impl CoveApp {
             if i.modifiers.ctrl && i.key_pressed(egui::Key::C) {
                 copy_to_clip = true;
             }
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::Z) {
+                undo = true;
+            }
             if i.key_pressed(egui::Key::Delete) {
                 delete_file = true;
             }
@@ -260,8 +352,10 @@ impl CoveApp {
             self.open_file_dialog();
         }
         if crop_to_selection {
-            self.viewer
-                .zoom_to_selection(self.current_image_size, self.canvas_rect);
+            self.crop_to_selection(ctx);
+        }
+        if undo {
+            self.undo_crop(ctx);
         }
         if copy_to_clip {
             self.copy_to_clipboard();
@@ -343,13 +437,24 @@ impl CoveApp {
                 });
 
                 ui.menu_button("Edit", |ui| {
+                    let can_undo = !self.undo_stack.is_empty();
+                    if ui.add_enabled(can_undo, egui::Button::new("Undo              Ctrl+Z")).clicked() {
+                        self.pending_undo = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Copy              Ctrl+C").clicked() {
                         self.copy_to_clipboard();
                         ui.close_menu();
                     }
                     ui.separator();
                     let has_sel = self.viewer.selection.as_ref().map(|s| s.is_significant()).unwrap_or(false);
-                    if ui.add_enabled(has_sel, egui::Button::new("Crop View        Ctrl+Y")).clicked() {
+                    if ui.add_enabled(has_sel, egui::Button::new("Crop Selection   Ctrl+Y")).clicked() {
+                        // Can't call crop_to_selection here (needs ctx), so set flag
+                        self.pending_crop = true;
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(has_sel, egui::Button::new("Zoom to Selection")).clicked() {
                         self.viewer.zoom_to_selection(self.current_image_size, self.canvas_rect);
                         ui.close_menu();
                     }
@@ -535,8 +640,15 @@ impl CoveApp {
                     .unwrap_or(false);
 
                 if ui
-                    .add_enabled(has_selection, egui::Button::new("Crop View"))
-                    .on_hover_text("Zoom to selection (Ctrl+Y)")
+                    .add_enabled(has_selection, egui::Button::new("Crop"))
+                    .on_hover_text("Crop to selection (Ctrl+Y)")
+                    .clicked()
+                {
+                    self.pending_crop = true;
+                }
+                if ui
+                    .add_enabled(has_selection, egui::Button::new("\u{1F50D}Sel"))
+                    .on_hover_text("Zoom to selection")
                     .clicked()
                 {
                     self.viewer
@@ -655,7 +767,11 @@ impl CoveApp {
                 if let Some(ref texture) = self.current_texture {
                     let tex = texture.clone();
                     let size = self.current_image_size;
-                    self.canvas_rect = self.viewer.paint(ui, &tex, size);
+                    let (rect, zoom_sel) = self.viewer.paint(ui, &tex, size);
+                    self.canvas_rect = rect;
+                    if zoom_sel {
+                        self.viewer.zoom_to_selection(self.current_image_size, self.canvas_rect);
+                    }
                 } else if let Some((_, msg)) = &self.error {
                     ui.centered_and_justified(|ui| {
                         ui.colored_label(
@@ -759,7 +875,7 @@ impl CoveApp {
                     ui.heading("Cove Image Viewer");
                     ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
                     ui.add_space(4.0);
-                    ui.label("The VLC of image viewers \u{2014} opens everything.");
+                    ui.label("The VLC of image viewers \u{2014} opens every image.");
                     ui.add_space(4.0);
                     ui.label("45+ image formats supported.");
                     ui.label("Built with Rust and egui.");
@@ -774,12 +890,14 @@ impl CoveApp {
 impl eframe::App for CoveApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let Some(decoded) = self.pending_image.take() {
+            let pixels_copy = decoded.pixels.clone();
             let texture = ctx.load_texture(
                 "current_image",
                 decoded.pixels,
                 egui::TextureOptions::LINEAR,
             );
             self.current_texture = Some(texture);
+            self.current_pixels = Some(pixels_copy);
         }
 
         self.handle_dropped_files(ctx);
@@ -798,6 +916,67 @@ impl eframe::App for CoveApp {
         self.draw_status_bar(ctx);
         self.draw_canvas(ctx);
         self.draw_dialogs(ctx);
+
+        if self.pending_crop {
+            self.pending_crop = false;
+            self.crop_to_selection(ctx);
+        }
+        if self.pending_undo {
+            self.pending_undo = false;
+            self.undo_crop(ctx);
+        }
+    }
+}
+
+fn apply_transform(img: &egui::ColorImage, rotation: i32, flip_h: bool, flip_v: bool) -> egui::ColorImage {
+    let w = img.width();
+    let h = img.height();
+
+    let get = |x: usize, y: usize| -> egui::Color32 {
+        let (mut sx, mut sy) = (x, y);
+        if flip_h { sx = w - 1 - sx; }
+        if flip_v { sy = h - 1 - sy; }
+        img.pixels[sy * w + sx]
+    };
+
+    match rotation {
+        0 => {
+            let mut pixels = Vec::with_capacity(w * h);
+            for y in 0..h {
+                for x in 0..w {
+                    pixels.push(get(x, y));
+                }
+            }
+            egui::ColorImage { size: [w, h], pixels }
+        }
+        90 => {
+            let mut pixels = Vec::with_capacity(w * h);
+            for x in 0..w {
+                for y in (0..h).rev() {
+                    pixels.push(get(x, y));
+                }
+            }
+            egui::ColorImage { size: [h, w], pixels }
+        }
+        180 => {
+            let mut pixels = Vec::with_capacity(w * h);
+            for y in (0..h).rev() {
+                for x in (0..w).rev() {
+                    pixels.push(get(x, y));
+                }
+            }
+            egui::ColorImage { size: [w, h], pixels }
+        }
+        270 => {
+            let mut pixels = Vec::with_capacity(w * h);
+            for x in (0..w).rev() {
+                for y in 0..h {
+                    pixels.push(get(x, y));
+                }
+            }
+            egui::ColorImage { size: [h, w], pixels }
+        }
+        _ => img.clone(),
     }
 }
 
