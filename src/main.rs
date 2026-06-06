@@ -1,5 +1,6 @@
 mod app;
 mod browser;
+mod cache;
 mod decoder;
 mod theme;
 mod viewer;

@@ -24,6 +24,9 @@ pcx = "0.2"
 heic = { version = "0.1", features = ["av1"] }
 openjp2 = "0.6"
 
+# EXIF metadata
+kamadak-exif = "0.5"
+
 # Clipboard and OS integration
 arboard = "3"
 wallpaper = "3"
@@ -35,7 +38,7 @@ default = []
 opt-level = 3
 lto = "thin"
 strip = "symbols"
-panic = "abort"
+panic = "unwind"
 
 [profile.dev]
 opt-level = 1

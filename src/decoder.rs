@@ -1,5 +1,6 @@
 use std::path::Path;
 
+#[derive(Clone)]
 pub struct DecodedImage {
     pub pixels: egui::ColorImage,
     pub format_name: String,
@@ -30,6 +31,13 @@ pub fn load_animated(path: &Path) -> Option<Vec<AnimatedFrame>> {
                 return None;
             }
             Box::new(decoder.into_frames())
+        }
+        "png" | "apng" => {
+            let decoder = image::codecs::png::PngDecoder::new(reader).ok()?;
+            if !decoder.is_apng().unwrap_or(false) {
+                return None;
+            }
+            Box::new(decoder.apng().ok()?.into_frames())
         }
         _ => return None,
     };
@@ -252,7 +260,45 @@ fn load_jxl(path: &Path) -> Result<DecodedImage, String> {
 
 // ─── Camera RAW via rawloader ───
 
+fn extract_raw_preview(path: &Path) -> Result<DecodedImage, String> {
+    let data = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
+
+    let mut best: Option<&[u8]> = None;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        if data[i] == 0xFF && data[i + 1] == 0xD8 {
+            let start = i;
+            i += 2;
+            while i + 1 < data.len() {
+                if data[i] == 0xFF && data[i + 1] == 0xD9 {
+                    let segment = &data[start..i + 2];
+                    if segment.len() > best.map_or(0, |b| b.len()) {
+                        best = Some(segment);
+                    }
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    let jpeg_data = best.filter(|b| b.len() > 32_000)
+        .ok_or("no usable preview")?;
+
+    let img = image::load_from_memory(jpeg_data)
+        .map_err(|e| format!("preview: {e}"))?;
+
+    Ok(to_color_image(img, "RAW"))
+}
+
 fn load_raw(path: &Path) -> Result<DecodedImage, String> {
+    if let Ok(preview) = extract_raw_preview(path) {
+        return Ok(preview);
+    }
+
     let raw = rawloader::decode_file(path).map_err(|e| format!("raw: {e}"))?;
 
     let width = raw.width;
@@ -774,6 +820,80 @@ fn load_sgi(path: &Path) -> Result<DecodedImage, String> {
         format_name: "SGI".to_string(),
         original_width: width as u32,
         original_height: height as u32,
+    })
+}
+
+// ─── Utility ───
+
+// ─── EXIF metadata ───
+
+pub struct ExifData {
+    pub camera: Option<String>,
+    pub lens: Option<String>,
+    pub focal_length: Option<String>,
+    pub aperture: Option<String>,
+    pub shutter_speed: Option<String>,
+    pub iso: Option<String>,
+    pub date_taken: Option<String>,
+    pub gps: Option<String>,
+    pub software: Option<String>,
+}
+
+pub fn read_exif(path: &Path) -> Option<ExifData> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let exif = exif::Reader::new().read_from_container(&mut reader).ok()?;
+
+    let get_str = |tag: exif::Tag| -> Option<String> {
+        exif.get_field(tag, exif::In::PRIMARY)
+            .map(|f| f.display_value().to_string().trim_matches('"').to_string())
+    };
+
+    let get_unit = |tag: exif::Tag| -> Option<String> {
+        exif.get_field(tag, exif::In::PRIMARY)
+            .map(|f| f.display_value().with_unit(&exif).to_string())
+    };
+
+    let make = get_str(exif::Tag::Make);
+    let model = get_str(exif::Tag::Model);
+    let camera = match (&make, &model) {
+        (Some(m), Some(md)) => {
+            if md.starts_with(m.trim()) {
+                Some(md.clone())
+            } else {
+                Some(format!("{} {}", m.trim(), md.trim()))
+            }
+        }
+        (None, Some(md)) => Some(md.clone()),
+        (Some(m), None) => Some(m.clone()),
+        (None, None) => None,
+    };
+
+    let gps = {
+        let lat = exif.get_field(exif::Tag::GPSLatitude, exif::In::PRIMARY);
+        let lat_ref = exif.get_field(exif::Tag::GPSLatitudeRef, exif::In::PRIMARY);
+        let lon = exif.get_field(exif::Tag::GPSLongitude, exif::In::PRIMARY);
+        let lon_ref = exif.get_field(exif::Tag::GPSLongitudeRef, exif::In::PRIMARY);
+        match (lat, lat_ref, lon, lon_ref) {
+            (Some(la), Some(lar), Some(lo), Some(lor)) => Some(format!(
+                "{} {} {} {}",
+                la.display_value(), lar.display_value(),
+                lo.display_value(), lor.display_value()
+            )),
+            _ => None,
+        }
+    };
+
+    Some(ExifData {
+        camera,
+        lens: get_str(exif::Tag::LensModel),
+        focal_length: get_unit(exif::Tag::FocalLength),
+        aperture: get_unit(exif::Tag::FNumber),
+        shutter_speed: get_unit(exif::Tag::ExposureTime),
+        iso: get_str(exif::Tag::PhotographicSensitivity),
+        date_taken: get_str(exif::Tag::DateTimeOriginal),
+        gps,
+        software: get_str(exif::Tag::Software),
     })
 }
 

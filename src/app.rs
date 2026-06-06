@@ -1,9 +1,12 @@
 use crate::browser::{Browser, SortMode};
+use crate::cache::{CachedImage, ImageCache};
 use crate::decoder::{self, DecodedImage};
 use crate::theme;
 use crate::viewer::{FitMode, ViewerState};
 use egui::{TextureHandle, Vec2};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::panic;
 
 pub struct CoveApp {
     browser: Browser,
@@ -36,10 +39,34 @@ pub struct CoveApp {
     anim_textures: Vec<TextureHandle>,
     anim_index: usize,
     anim_timer: f32,
+    current_exif: Option<decoder::ExifData>,
+    save_as_path: Option<PathBuf>,
+    save_as_pixels: Option<egui::ColorImage>,
+    save_as_format: String,
+    jpeg_quality: i32,
+    png_compression: i32,
+    compare_texture: Option<TextureHandle>,
+    compare_image_size: Vec2,
+    compare_path: Option<PathBuf>,
+    compare_mode: bool,
+    loading_path: Option<PathBuf>,
+    load_generation: u64,
+    inflight_paths: Vec<PathBuf>,
+    load_tx: mpsc::Sender<LoadComplete>,
+    load_rx: mpsc::Receiver<LoadComplete>,
+    image_cache: ImageCache,
+}
+
+struct LoadComplete {
+    path: PathBuf,
+    file_size: u64,
+    generation: u64,
+    result: Result<CachedImage, String>,
 }
 
 impl CoveApp {
     pub fn new(path: Option<PathBuf>) -> Self {
+        let (load_tx, load_rx) = mpsc::channel();
         let mut app = Self {
             browser: Browser::new(),
             viewer: ViewerState::new(),
@@ -71,6 +98,22 @@ impl CoveApp {
             anim_textures: Vec::new(),
             anim_index: 0,
             anim_timer: 0.0,
+            current_exif: None,
+            save_as_path: None,
+            save_as_pixels: None,
+            save_as_format: String::new(),
+            jpeg_quality: 92,
+            png_compression: 6,
+            compare_texture: None,
+            compare_image_size: Vec2::ZERO,
+            compare_path: None,
+            compare_mode: false,
+            loading_path: None,
+            load_generation: 0,
+            inflight_paths: Vec::new(),
+            load_tx,
+            load_rx,
+            image_cache: ImageCache::new(20),
         };
 
         if let Some(p) = path {
@@ -90,31 +133,31 @@ impl CoveApp {
     }
 
     fn load_image(&mut self, path: &Path) {
-        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let path = path.to_path_buf();
+        let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
-        self.anim_frames.clear();
-        self.anim_textures.clear();
-        self.anim_index = 0;
-        self.anim_timer = 0.0;
-
-        if let Some(frames) = decoder::load_animated(path) {
-            let first = &frames[0];
-            let w = first.pixels.width() as u32;
-            let h = first.pixels.height() as u32;
-            self.anim_frames = frames.into_iter().map(|f| (f.pixels, f.delay_ms)).collect();
-            self.current_path = Some(path.to_path_buf());
-            self.current_image_size = Vec2::new(w as f32, h as f32);
-            self.current_format = path.extension().and_then(|e| e.to_str()).map(|e| e.to_uppercase()).unwrap_or_else(|| "GIF".into());
-            self.current_file_size = file_size;
-            self.error = None;
-            self.pending_image = None;
-            self.undo_stack.clear();
-            self.viewer.reset_for_new_image();
+        if let Some(cached) = self.image_cache.get(&path) {
+            self.apply_cached_image(&path, file_size, cached);
+            self.prefetch_adjacent();
             return;
         }
 
-        match decoder::load_image(path) {
-            Ok(decoded) => {
+        self.load_generation += 1;
+        let gen = self.load_generation;
+        self.loading_path = Some(path.clone());
+        self.inflight_paths.push(path.clone());
+        let tx = self.load_tx.clone();
+        std::thread::spawn(move || {
+            let result = decode_to_cached(&path);
+            let _ = tx.send(LoadComplete { path, file_size, generation: gen, result });
+        });
+    }
+
+    fn apply_cached_image(&mut self, path: &Path, file_size: u64, image: CachedImage) {
+        self.loading_path = None;
+
+        match image {
+            CachedImage::Static(decoded) => {
                 let locked_zoom = if self.lock_zoom {
                     Some((self.viewer.zoom, self.viewer.fit_mode))
                 } else {
@@ -135,12 +178,118 @@ impl CoveApp {
                 self.error = None;
                 self.pending_image = Some(decoded);
                 self.undo_stack.clear();
+                self.anim_frames.clear();
+                self.anim_textures.clear();
+                self.anim_index = 0;
+                self.anim_timer = 0.0;
             }
-            Err(e) => {
-                self.error = Some((path.to_path_buf(), e));
-                self.current_texture = None;
+            CachedImage::Animated(frames) => {
+                let first = &frames[0];
+                let w = first.0.width() as u32;
+                let h = first.0.height() as u32;
+                self.viewer.reset_for_new_image();
                 self.current_path = Some(path.to_path_buf());
+                self.current_image_size = Vec2::new(w as f32, h as f32);
+                self.current_format = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| e.to_uppercase())
+                    .unwrap_or_else(|| "GIF".into());
+                self.current_file_size = file_size;
+                self.error = None;
+                self.pending_image = None;
+                self.undo_stack.clear();
+                self.anim_frames = frames;
+                self.anim_textures.clear();
+                self.anim_index = 0;
+                self.anim_timer = 0.0;
             }
+        }
+        self.current_exif = decoder::read_exif(path);
+    }
+
+    fn prefetch_adjacent(&mut self) {
+        let total = self.browser.files.len();
+        if total <= 1 {
+            return;
+        }
+        let idx = self.browser.index;
+        let next_idx = if idx + 1 < total { idx + 1 } else { 0 };
+        let prev_idx = if idx > 0 { idx - 1 } else { total - 1 };
+
+        for &i in &[next_idx, prev_idx] {
+            if i == idx {
+                continue;
+            }
+            let path = self.browser.files[i].clone();
+            if self.image_cache.contains(&path) || self.inflight_paths.contains(&path) {
+                continue;
+            }
+            self.inflight_paths.push(path.clone());
+            let tx = self.load_tx.clone();
+            std::thread::spawn(move || {
+                let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let result = decode_to_cached(&path);
+                let _ = tx.send(LoadComplete { path, file_size, generation: 0, result });
+            });
+        }
+    }
+
+    fn save_as_dialog(&mut self) {
+        let pixels = match &self.current_pixels {
+            Some(p) => p,
+            None => return,
+        };
+        let name = self.current_path.as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("image");
+
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Save As")
+            .set_file_name(&format!("{name}.png"))
+            .add_filter("PNG", &["png"])
+            .add_filter("JPEG", &["jpg", "jpeg"])
+            .add_filter("BMP", &["bmp"])
+            .add_filter("TIFF", &["tiff", "tif"])
+            .add_filter("WebP", &["webp"])
+            .add_filter("GIF", &["gif"])
+            .add_filter("TGA", &["tga"])
+            .add_filter("QOI", &["qoi"])
+            .add_filter("PPM", &["ppm"])
+            .add_filter("farbfeld", &["ff"])
+            .add_filter("All files", &["*"])
+            .save_file()
+        {
+            let ext = path.extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase())
+                .unwrap_or_default();
+            if ext == "jpg" || ext == "jpeg" || ext == "png" {
+                self.save_as_format = ext;
+                self.save_as_pixels = Some(pixels.clone());
+                self.save_as_path = Some(path);
+            } else {
+                save_image(pixels, &path);
+            }
+        }
+    }
+
+    fn toggle_compare(&mut self) {
+        if self.compare_mode {
+            self.compare_mode = false;
+            self.compare_texture = None;
+            self.compare_path = None;
+            return;
+        }
+        if self.compare_texture.is_none() {
+            if let Some(tex) = &self.current_texture {
+                self.compare_texture = Some(tex.clone());
+                self.compare_image_size = self.current_image_size;
+                self.compare_path = self.current_path.clone();
+            }
+        } else {
+            self.compare_mode = true;
         }
     }
 
@@ -330,7 +479,11 @@ impl CoveApp {
                 toggle_fullscreen = true;
             }
             if i.key_pressed(egui::Key::Escape) {
-                if self.viewer.selection.is_some() {
+                if self.compare_mode {
+                    self.compare_mode = false;
+                    self.compare_texture = None;
+                    self.compare_path = None;
+                } else if self.viewer.selection.is_some() {
                     self.viewer.clear_selection();
                 } else if self.slideshow_active {
                     self.slideshow_active = false;
@@ -352,6 +505,12 @@ impl CoveApp {
             }
             if i.modifiers.ctrl && i.key_pressed(egui::Key::Z) {
                 undo = true;
+            }
+            if i.modifiers.ctrl && i.modifiers.shift && i.key_pressed(egui::Key::S) {
+                text_actions.push("__save_as__".into());
+            }
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::K) {
+                text_actions.push("__compare__".into());
             }
             if i.key_pressed(egui::Key::Delete) {
                 delete_file = true;
@@ -394,7 +553,7 @@ impl CoveApp {
         if copy_to_clip {
             self.copy_to_clipboard();
         }
-        if delete_file {
+        if delete_file && self.loading_path.is_none() {
             if let Some(p) = &self.current_path {
                 self.confirm_delete = Some(p.clone());
             }
@@ -406,7 +565,7 @@ impl CoveApp {
                 "0" => self.viewer.set_fit_mode(FitMode::FitWindow),
                 "1" => self.viewer.set_fit_mode(FitMode::ActualSize),
                 "f" => self.viewer.cycle_fit_mode(),
-                "i" => self.show_info = !self.show_info,
+                "i" => self.show_image_info = !self.show_image_info,
                 "r" => self.viewer.rotate_cw(),
                 "l" => self.viewer.rotate_ccw(),
                 "h" => self.viewer.flip_horizontal(),
@@ -418,6 +577,8 @@ impl CoveApp {
                         self.fullscreen = true;
                     }
                 }
+                "__save_as__" => if self.loading_path.is_none() { self.save_as_dialog() },
+                "__compare__" => self.toggle_compare(),
                 _ => {}
             }
         }
@@ -556,8 +717,23 @@ impl CoveApp {
                         if self.slideshow_active { self.fullscreen = true; }
                         ui.close_menu();
                     }
+                    ui.menu_button("Slideshow Interval", |ui| {
+                        for &secs in &[2.0_f32, 3.0, 5.0, 10.0, 15.0, 30.0] {
+                            let label = format!("{:.0}s", secs);
+                            if ui.selectable_label((self.slideshow_interval - secs).abs() < 0.1, &label).clicked() {
+                                self.slideshow_interval = secs;
+                                ui.close_menu();
+                            }
+                        }
+                    });
                     ui.separator();
-                    let del_enabled = self.current_path.is_some();
+                    let save_enabled = self.current_pixels.is_some() && self.loading_path.is_none();
+                    if ui.add_enabled(save_enabled, egui::Button::new("Save As...   Ctrl+Shift+S")).clicked() {
+                        self.save_as_dialog();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    let del_enabled = self.current_path.is_some() && self.loading_path.is_none();
                     if ui.add_enabled(del_enabled, egui::Button::new("Delete File         Del")).clicked() {
                         if let Some(p) = &self.current_path {
                             self.confirm_delete = Some(p.clone());
@@ -624,6 +800,25 @@ impl CoveApp {
                     if ui.button("Flip Vertical         V").clicked() {
                         self.viewer.flip_vertical();
                         ui.close_menu();
+                    }
+                    ui.separator();
+                    let compare_label = if self.compare_mode {
+                        "Exit Compare     Ctrl+K"
+                    } else if self.compare_texture.is_some() {
+                        "Compare          Ctrl+K"
+                    } else {
+                        "Set Reference    Ctrl+K"
+                    };
+                    if ui.button(compare_label).clicked() {
+                        self.toggle_compare();
+                        ui.close_menu();
+                    }
+                    if self.compare_texture.is_some() && !self.compare_mode {
+                        if ui.button("Clear Reference").clicked() {
+                            self.compare_texture = None;
+                            self.compare_path = None;
+                            ui.close_menu();
+                        }
                     }
                 });
 
@@ -870,9 +1065,22 @@ impl CoveApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.colored_label(theme::TEXT_DIM, self.browser.position_label());
 
+                        if self.loading_path.is_some() {
+                            ui.separator();
+                            ui.colored_label(theme::ACCENT, "Loading\u{2026}");
+                        }
+
+                        if self.compare_mode {
+                            ui.separator();
+                            ui.colored_label(theme::ACCENT, "Compare");
+                        } else if self.compare_texture.is_some() {
+                            ui.separator();
+                            ui.colored_label(theme::TEXT_FAINT, "Ref set");
+                        }
+
                         if self.slideshow_active {
                             ui.separator();
-                            ui.colored_label(theme::ACCENT_2, "\u{25B6} Slideshow");
+                            ui.colored_label(theme::ACCENT_2, format!("\u{25B6} {:.0}s", self.slideshow_interval));
                         }
 
                         if let Some(sel) = &self.viewer.selection {
@@ -896,7 +1104,9 @@ impl CoveApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE.fill(theme::CANVAS_BG))
             .show(ctx, |ui| {
-                if let Some(ref texture) = self.current_texture {
+                if self.compare_mode {
+                    self.draw_compare_canvas(ui);
+                } else if let Some(ref texture) = self.current_texture {
                     let tex = texture.clone();
                     let size = self.current_image_size;
                     let (rect, zoom_sel) = self.viewer.paint(ui, &tex, size);
@@ -936,7 +1146,7 @@ impl CoveApp {
                             }
                             ui.add_space(12.0);
                             ui.label(
-                                egui::RichText::new("JPG \u{00B7} PNG \u{00B7} GIF \u{00B7} WebP \u{00B7} AVIF \u{00B7} HEIC \u{00B7} SVG \u{00B7} PSD \u{00B7} TIFF \u{00B7} RAW \u{00B7} JXL \u{00B7} JP2 \u{00B7} ICO \u{00B7} BMP \u{00B7} QOI \u{00B7} EXR \u{00B7} and 30 more")
+                                egui::RichText::new("JPG \u{00B7} PNG \u{00B7} GIF \u{00B7} WebP \u{00B7} AVIF \u{00B7} HEIC \u{00B7} SVG \u{00B7} PSD \u{00B7} TIFF \u{00B7} RAW \u{00B7} JXL \u{00B7} JP2 \u{00B7} ICO \u{00B7} BMP \u{00B7} QOI \u{00B7} EXR \u{00B7} and 45 more")
                                     .size(10.0)
                                     .color(theme::TEXT_FAINT),
                             );
@@ -944,6 +1154,73 @@ impl CoveApp {
                     });
                 }
             });
+    }
+
+    fn draw_compare_canvas(&self, ui: &mut egui::Ui) {
+        let canvas = ui.available_rect_before_wrap();
+        let half_w = canvas.width() / 2.0 - 1.0;
+
+        if let Some(ref left_tex) = self.compare_texture {
+            let left_rect = egui::Rect::from_min_size(canvas.min, egui::vec2(half_w, canvas.height()));
+            paint_fitted(ui, left_tex, self.compare_image_size, left_rect);
+            let left_name = self.compare_path.as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("Reference");
+            ui.painter().text(
+                egui::pos2(left_rect.center().x, left_rect.min.y + 8.0),
+                egui::Align2::CENTER_TOP, left_name,
+                egui::FontId::proportional(11.0), theme::TEXT_DIM,
+            );
+        }
+
+        let div_x = canvas.min.x + half_w;
+        ui.painter().line_segment(
+            [egui::pos2(div_x, canvas.min.y), egui::pos2(div_x, canvas.max.y)],
+            egui::Stroke::new(2.0, theme::ACCENT),
+        );
+
+        if let Some(ref right_tex) = self.current_texture {
+            let right_rect = egui::Rect::from_min_size(
+                egui::pos2(div_x + 2.0, canvas.min.y),
+                egui::vec2(half_w, canvas.height()),
+            );
+            paint_fitted(ui, right_tex, self.current_image_size, right_rect);
+            let right_name = self.current_path.as_ref()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("Current");
+            ui.painter().text(
+                egui::pos2(right_rect.center().x, right_rect.min.y + 8.0),
+                egui::Align2::CENTER_TOP, right_name,
+                egui::FontId::proportional(11.0), theme::TEXT_DIM,
+            );
+        }
+
+        ui.allocate_rect(canvas, egui::Sense::hover());
+    }
+
+    fn draw_drop_overlay(&self, ctx: &egui::Context) {
+        let hovered = ctx.input(|i| !i.raw.hovered_files.is_empty());
+        if !hovered {
+            return;
+        }
+        let screen = ctx.screen_rect();
+        let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drop_overlay"));
+        let painter = ctx.layer_painter(layer);
+        painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(180));
+        painter.rect_stroke(
+            screen.shrink(8.0), 12.0,
+            egui::Stroke::new(2.0, theme::ACCENT),
+            egui::StrokeKind::Inside,
+        );
+        painter.text(
+            screen.center(),
+            egui::Align2::CENTER_CENTER,
+            "Drop image to open",
+            egui::FontId::proportional(22.0),
+            theme::ACCENT,
+        );
     }
 
     fn draw_dialogs(&mut self, ctx: &egui::Context) {
@@ -1018,9 +1295,68 @@ impl CoveApp {
                             ui.label("Position:");
                             ui.label(self.browser.position_label());
                             ui.end_row();
+
+                            if let Some(exif) = &self.current_exif {
+                                ui.separator(); ui.separator(); ui.end_row();
+
+                                let fields: &[(&str, &Option<String>)] = &[
+                                    ("Camera:", &exif.camera),
+                                    ("Lens:", &exif.lens),
+                                    ("Focal Length:", &exif.focal_length),
+                                    ("Aperture:", &exif.aperture),
+                                    ("Shutter:", &exif.shutter_speed),
+                                    ("ISO:", &exif.iso),
+                                    ("Date Taken:", &exif.date_taken),
+                                    ("GPS:", &exif.gps),
+                                    ("Software:", &exif.software),
+                                ];
+                                for (label, value) in fields {
+                                    if let Some(v) = value {
+                                        ui.label(*label);
+                                        ui.label(v);
+                                        ui.end_row();
+                                    }
+                                }
+                            }
                         });
                     });
                 self.show_image_info = open;
+            }
+        }
+
+        if self.save_as_path.is_some() {
+            let mut should_save = false;
+            let mut should_cancel = false;
+            let is_jpeg = self.save_as_format == "jpg" || self.save_as_format == "jpeg";
+            let title = if is_jpeg { "JPEG Save Options" } else { "PNG Save Options" };
+            egui::Window::new(title)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    if is_jpeg {
+                        ui.add(egui::Slider::new(&mut self.jpeg_quality, 1..=100).text("Quality"));
+                    } else {
+                        ui.add(egui::Slider::new(&mut self.png_compression, 0..=9).text("Compression"));
+                        ui.label(egui::RichText::new("0 = none, 6 = default, 9 = best").size(10.0).color(theme::TEXT_FAINT));
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Save").clicked() { should_save = true; }
+                        if ui.button("Cancel").clicked() { should_cancel = true; }
+                    });
+                });
+            if should_save {
+                if let (Some(path), Some(pixels)) = (self.save_as_path.take(), self.save_as_pixels.take()) {
+                    if is_jpeg {
+                        save_jpeg(&pixels, &path, self.jpeg_quality as u8);
+                    } else {
+                        save_png(&pixels, &path, self.png_compression as u8);
+                    }
+                }
+            } else if should_cancel {
+                self.save_as_path = None;
+                self.save_as_pixels = None;
             }
         }
 
@@ -1098,7 +1434,7 @@ impl CoveApp {
                                 ui.add_space(8.0);
                                 ui.label(egui::RichText::new("\u{201C}The VLC of image viewers.\u{201D}").italics().size(13.0));
                                 ui.add_space(2.0);
-                                ui.label(egui::RichText::new("Opens every image. 45+ formats, one window.").color(theme::TEXT_DIM).size(12.0));
+                                ui.label(egui::RichText::new("Opens every image. 60+ formats, one window.").color(theme::TEXT_DIM).size(12.0));
 
                                 ui.add_space(12.0);
 
@@ -1157,6 +1493,40 @@ impl eframe::App for CoveApp {
             }
         }
 
+        while let Ok(complete) = self.load_rx.try_recv() {
+            self.inflight_paths.retain(|p| p != &complete.path);
+            let is_target = self.loading_path.as_ref() == Some(&complete.path)
+                && complete.generation == self.load_generation;
+            match complete.result {
+                Ok(image) => {
+                    if is_target {
+                        self.image_cache.put(complete.path.clone(), image.clone());
+                        self.apply_cached_image(&complete.path, complete.file_size, image);
+                        self.prefetch_adjacent();
+                    } else {
+                        self.image_cache.put(complete.path, image);
+                    }
+                }
+                Err(e) => {
+                    if is_target {
+                        self.loading_path = None;
+                        self.current_path = Some(complete.path.clone());
+                        self.error = Some((complete.path, e));
+                        self.current_texture = None;
+                        self.current_pixels = None;
+                        self.current_exif = None;
+                        self.anim_frames.clear();
+                        self.anim_textures.clear();
+                        self.anim_index = 0;
+                        self.anim_timer = 0.0;
+                    }
+                }
+            }
+        }
+        if self.loading_path.is_some() {
+            ctx.request_repaint();
+        }
+
         if let Some(decoded) = self.pending_image.take() {
             let pixels_copy = decoded.pixels.clone();
             let texture = ctx.load_texture(
@@ -1210,6 +1580,7 @@ impl eframe::App for CoveApp {
         self.draw_status_bar(ctx);
         self.draw_canvas(ctx);
         self.draw_dialogs(ctx);
+        self.draw_drop_overlay(ctx);
 
         if self.pending_crop {
             self.pending_crop = false;
@@ -1220,6 +1591,93 @@ impl eframe::App for CoveApp {
             self.undo_crop(ctx);
         }
     }
+}
+
+fn paint_fitted(ui: &egui::Ui, tex: &TextureHandle, img_size: Vec2, rect: egui::Rect) {
+    let scale = (rect.width() / img_size.x).min(rect.height() / img_size.y);
+    let scaled = img_size * scale;
+    let center = rect.center();
+    let dest = egui::Rect::from_center_size(center, scaled);
+    ui.painter().image(
+        tex.id(), dest,
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+}
+
+fn safe_write(path: &Path, write_fn: impl FnOnce(&Path) -> Result<(), String>) {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("tmp");
+    let tmp = path.with_file_name(format!(
+        ".{}.tmp.{ext}",
+        path.file_stem().and_then(|s| s.to_str()).unwrap_or("img")
+    ));
+    if write_fn(&tmp).is_ok() {
+        if std::fs::rename(&tmp, path).is_err() {
+            eprintln!("Save failed: could not replace {}", path.display());
+        }
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn save_image(pixels: &egui::ColorImage, path: &Path) {
+    let w = pixels.width() as u32;
+    let h = pixels.height() as u32;
+    let rgba: Vec<u8> = pixels.pixels.iter().flat_map(|c| c.to_array()).collect();
+    if let Some(img) = image::RgbaImage::from_raw(w, h, rgba) {
+        safe_write(path, |tmp| {
+            image::DynamicImage::ImageRgba8(img).save(tmp).map_err(|e| e.to_string())
+        });
+    }
+}
+
+fn save_png(pixels: &egui::ColorImage, path: &Path, compression: u8) {
+    use image::ImageEncoder;
+    let w = pixels.width() as u32;
+    let h = pixels.height() as u32;
+    let rgba: Vec<u8> = pixels.pixels.iter().flat_map(|c| c.to_array()).collect();
+    safe_write(path, |tmp| {
+        let file = std::fs::File::create(tmp).map_err(|e| e.to_string())?;
+        let writer = std::io::BufWriter::new(file);
+        let encoder = image::codecs::png::PngEncoder::new_with_quality(
+            writer,
+            match compression {
+                0 => image::codecs::png::CompressionType::Fast,
+                1..=6 => image::codecs::png::CompressionType::Default,
+                _ => image::codecs::png::CompressionType::Best,
+            },
+            image::codecs::png::FilterType::Adaptive,
+        );
+        encoder.write_image(&rgba, w, h, image::ExtendedColorType::Rgba8).map_err(|e| e.to_string())
+    });
+}
+
+fn save_jpeg(pixels: &egui::ColorImage, path: &Path, quality: u8) {
+    let w = pixels.width() as u32;
+    let h = pixels.height() as u32;
+    let rgba: Vec<u8> = pixels.pixels.iter().flat_map(|c| c.to_array()).collect();
+    if let Some(img) = image::RgbaImage::from_raw(w, h, rgba) {
+        let rgb = image::DynamicImage::ImageRgba8(img).into_rgb8();
+        safe_write(path, |tmp| {
+            let file = std::fs::File::create(tmp).map_err(|e| e.to_string())?;
+            let mut writer = std::io::BufWriter::new(file);
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut writer, quality);
+            rgb.write_with_encoder(encoder).map_err(|e| e.to_string())
+        });
+    }
+}
+
+fn decode_to_cached(path: &Path) -> Result<CachedImage, String> {
+    panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        if let Some(frames) = decoder::load_animated(path) {
+            Ok(CachedImage::Animated(
+                frames.into_iter().map(|f| (f.pixels, f.delay_ms)).collect(),
+            ))
+        } else {
+            decoder::load_image(path).map(CachedImage::Static)
+        }
+    }))
+    .unwrap_or_else(|_| Err("decoder panic".into()))
 }
 
 fn apply_transform(img: &egui::ColorImage, rotation: i32, flip_h: bool, flip_v: bool) -> egui::ColorImage {
