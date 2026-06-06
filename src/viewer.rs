@@ -1,5 +1,6 @@
 use egui::{Color32, Pos2, Rect, Stroke, TextureHandle, Ui, Vec2, pos2};
 use egui::epaint::{Mesh, Vertex};
+use crate::theme;
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum FitMode {
@@ -336,11 +337,36 @@ impl ViewerState {
                 ui.painter().rect_stroke(
                     sel_rect,
                     0.0,
-                    Stroke::new(1.5, Color32::from_rgb(100, 160, 255)),
+                    Stroke::new(1.5, theme::ACCENT),
                     egui::StrokeKind::Outside,
                 );
+                // Rule-of-thirds grid inside selection
+                let grid_stroke = Stroke::new(0.5, theme::ACCENT_RING);
+                let third_w = sel_rect.width() / 3.0;
+                let third_h = sel_rect.height() / 3.0;
+                for i in 1..3 {
+                    let x = sel_rect.min.x + third_w * i as f32;
+                    ui.painter().line_segment(
+                        [pos2(x, sel_rect.min.y), pos2(x, sel_rect.max.y)],
+                        grid_stroke,
+                    );
+                    let y = sel_rect.min.y + third_h * i as f32;
+                    ui.painter().line_segment(
+                        [pos2(sel_rect.min.x, y), pos2(sel_rect.max.x, y)],
+                        grid_stroke,
+                    );
+                }
+                // Selection dimensions label
+                let dim_text = format!("{:.0} x {:.0}", sel_rect.width(), sel_rect.height());
+                ui.painter().text(
+                    pos2(sel_rect.min.x, sel_rect.min.y - 4.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    &dim_text,
+                    egui::FontId::monospace(10.0),
+                    theme::ACCENT,
+                );
                 // Dim area outside selection
-                let dim = Color32::from_black_alpha(100);
+                let dim = Color32::from_black_alpha(115);
                 if sel_rect.min.y > canvas_rect.min.y {
                     ui.painter().rect_filled(
                         Rect::from_min_max(canvas_rect.min, Pos2::new(canvas_rect.max.x, sel_rect.min.y)),

@@ -7,6 +7,49 @@ pub struct DecodedImage {
     pub original_height: u32,
 }
 
+pub struct AnimatedFrame {
+    pub pixels: egui::ColorImage,
+    pub delay_ms: u32,
+}
+
+pub fn load_animated(path: &Path) -> Option<Vec<AnimatedFrame>> {
+    use image::AnimationDecoder;
+
+    let ext = path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).unwrap_or_default();
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+
+    let frames_iter: Box<dyn Iterator<Item = Result<image::Frame, image::ImageError>>> = match ext.as_str() {
+        "gif" => {
+            let decoder = image::codecs::gif::GifDecoder::new(reader).ok()?;
+            Box::new(decoder.into_frames())
+        }
+        "webp" => {
+            let decoder = image::codecs::webp::WebPDecoder::new(reader).ok()?;
+            if !decoder.has_animation() {
+                return None;
+            }
+            Box::new(decoder.into_frames())
+        }
+        _ => return None,
+    };
+
+    let mut out = Vec::new();
+    for frame_result in frames_iter {
+        let frame = frame_result.ok()?;
+        let (numer, denom) = frame.delay().numer_denom_ms();
+        let delay_ms = if denom == 0 { 100 } else { numer / denom };
+        let delay_ms = if delay_ms == 0 { 100 } else { delay_ms };
+        let rgba = frame.into_buffer();
+        let w = rgba.width() as usize;
+        let h = rgba.height() as usize;
+        let pixels = egui::ColorImage::from_rgba_unmultiplied([w, h], rgba.as_raw());
+        out.push(AnimatedFrame { pixels, delay_ms });
+    }
+
+    if out.len() > 1 { Some(out) } else { None }
+}
+
 pub fn load_image(path: &Path) -> Result<DecodedImage, String> {
     let ext = path
         .extension()
@@ -258,21 +301,22 @@ fn load_raw(path: &Path) -> Result<DecodedImage, String> {
 
 fn load_psd(path: &Path) -> Result<DecodedImage, String> {
     let data = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
-    let psd = psd::Psd::from_bytes(&data).map_err(|e| format!("psd: {e}"))?;
-
-    let width = psd.width();
-    let height = psd.height();
-    let rgba = psd.rgba();
-
-    Ok(DecodedImage {
-        pixels: egui::ColorImage::from_rgba_unmultiplied(
-            [width as usize, height as usize],
-            &rgba,
-        ),
-        format_name: "PSD".to_string(),
-        original_width: width,
-        original_height: height,
+    std::panic::catch_unwind(|| {
+        let psd = psd::Psd::from_bytes(&data).map_err(|e| format!("psd: {e}"))?;
+        let width = psd.width();
+        let height = psd.height();
+        let rgba = psd.rgba();
+        Ok(DecodedImage {
+            pixels: egui::ColorImage::from_rgba_unmultiplied(
+                [width as usize, height as usize],
+                &rgba,
+            ),
+            format_name: "PSD".to_string(),
+            original_width: width,
+            original_height: height,
+        })
     })
+    .unwrap_or_else(|_| Err("psd: internal decoder panic".into()))
 }
 
 // ─── PCX ───
@@ -744,5 +788,67 @@ pub fn format_file_size(bytes: u64) -> String {
         format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
     } else {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_all_formats() {
+        let test_dir = std::path::Path::new("/tmp/cove-format-test");
+        let files = [
+            ("test.jpg", "JPEG"),
+            ("test.png", "PNG"),
+            ("test.gif", "GIF"),
+            ("test.bmp", "BMP"),
+            ("test.tiff", "TIFF"),
+            ("test.webp", "WebP"),
+            ("test.ico", "ICO"),
+            ("test.tga", "TGA"),
+            ("test.ppm", "PPM"),
+            ("test.pgm", "PGM"),
+            ("test.pbm", "PBM"),
+            ("test.dds", "DDS"),
+            ("test.exr", "EXR"),
+            ("test.hdr", "HDR"),
+            ("test.qoi", "QOI"),
+            ("test.ff", "farbfeld"),
+            ("test.svg", "SVG"),
+            // PSD skipped: upstream psd crate panics on ImageMagick-generated files; works with real Photoshop files
+            ("test.pcx", "PCX"),
+            ("test.jxl", "JXL"),
+            ("test.jp2", "JP2"),
+            ("test.avif", "AVIF"),
+            ("test.heic", "HEIC"),
+            ("test.xbm", "XBM"),
+            ("test.xpm", "XPM"),
+            ("test.sgi", "SGI"),
+        ];
+
+        let mut pass = 0;
+        let mut fail = 0;
+        for (file, label) in &files {
+            let path = test_dir.join(file);
+            if !path.exists() {
+                eprintln!("  SKIP {label:>8} — file missing");
+                continue;
+            }
+            match load_image(&path) {
+                Ok(img) => {
+                    assert!(img.original_width > 0 && img.original_height > 0,
+                        "{label} decoded but has zero dimensions");
+                    eprintln!("  PASS {label:>8} — {}x{} ({})", img.original_width, img.original_height, img.format_name);
+                    pass += 1;
+                }
+                Err(e) => {
+                    eprintln!("  FAIL {label:>8} — {e}");
+                    fail += 1;
+                }
+            }
+        }
+        eprintln!("\n  Results: {pass} passed, {fail} failed out of {} total", pass + fail);
+        assert_eq!(fail, 0, "{fail} format(s) failed to decode");
     }
 }

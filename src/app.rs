@@ -1,5 +1,6 @@
 use crate::browser::{Browser, SortMode};
 use crate::decoder::{self, DecodedImage};
+use crate::theme;
 use crate::viewer::{FitMode, ViewerState};
 use egui::{TextureHandle, Vec2};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,12 @@ pub struct CoveApp {
     pending_crop: bool,
     pending_undo: bool,
     undo_stack: Vec<(egui::ColorImage, Vec2)>,
+    icon_texture: Option<TextureHandle>,
+    tb_press_pos: Option<egui::Pos2>,
+    anim_frames: Vec<(egui::ColorImage, u32)>,
+    anim_textures: Vec<TextureHandle>,
+    anim_index: usize,
+    anim_timer: f32,
 }
 
 impl CoveApp {
@@ -58,6 +65,12 @@ impl CoveApp {
             pending_crop: false,
             pending_undo: false,
             undo_stack: Vec::new(),
+            icon_texture: None,
+            tb_press_pos: None,
+            anim_frames: Vec::new(),
+            anim_textures: Vec::new(),
+            anim_index: 0,
+            anim_timer: 0.0,
         };
 
         if let Some(p) = path {
@@ -78,6 +91,27 @@ impl CoveApp {
 
     fn load_image(&mut self, path: &Path) {
         let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+        self.anim_frames.clear();
+        self.anim_textures.clear();
+        self.anim_index = 0;
+        self.anim_timer = 0.0;
+
+        if let Some(frames) = decoder::load_animated(path) {
+            let first = &frames[0];
+            let w = first.pixels.width() as u32;
+            let h = first.pixels.height() as u32;
+            self.anim_frames = frames.into_iter().map(|f| (f.pixels, f.delay_ms)).collect();
+            self.current_path = Some(path.to_path_buf());
+            self.current_image_size = Vec2::new(w as f32, h as f32);
+            self.current_format = path.extension().and_then(|e| e.to_str()).map(|e| e.to_uppercase()).unwrap_or_else(|| "GIF".into());
+            self.current_file_size = file_size;
+            self.error = None;
+            self.pending_image = None;
+            self.undo_stack.clear();
+            self.viewer.reset_for_new_image();
+            return;
+        }
 
         match decoder::load_image(path) {
             Ok(decoded) => {
@@ -403,12 +437,112 @@ impl CoveApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
+    fn draw_titlebar(&mut self, ctx: &egui::Context) {
+        if self.fullscreen {
+            return;
+        }
+
+        egui::TopBottomPanel::top("titlebar")
+            .exact_height(40.0)
+            .frame(
+                egui::Frame::new()
+                    .fill(theme::BG)
+                    .inner_margin(egui::Margin { left: 12, right: 8, top: 0, bottom: 0 })
+                    .stroke(egui::Stroke::new(1.0, theme::BORDER)),
+            )
+            .show(ctx, |ui| {
+                let panel_rect = ui.available_rect_before_wrap();
+                let mut btn_rects: Vec<egui::Rect> = Vec::new();
+
+                ui.horizontal_centered(|ui| {
+                    if let Some(tex) = &self.icon_texture {
+                        ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(24.0, 24.0)));
+                    }
+
+                    ui.add_space(8.0);
+
+                    let title_rect = ui.available_rect_before_wrap();
+                    let title_center = title_rect.center();
+                    ui.painter().text(
+                        egui::pos2(title_center.x, title_center.y),
+                        egui::Align2::CENTER_CENTER,
+                        "Cove Image Viewer v1.0.0",
+                        egui::FontId::proportional(12.0),
+                        theme::TEXT_DIM,
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+
+                        let close_r = ui.add(egui::Button::new(
+                            egui::RichText::new("x").size(13.0).color(theme::TEXT_FAINT),
+                        ).min_size(egui::vec2(36.0, 28.0)));
+                        if close_r.clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        btn_rects.push(close_r.rect);
+
+                        let max_r = ui.add(egui::Button::new(
+                            egui::RichText::new("\u{25A1}").size(12.0).color(theme::TEXT_FAINT),
+                        ).min_size(egui::vec2(36.0, 28.0)));
+                        if max_r.clicked() {
+                            let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                        }
+                        btn_rects.push(max_r.rect);
+
+                        let min_r = ui.add(egui::Button::new(
+                            egui::RichText::new("\u{2013}").size(13.0).color(theme::TEXT_FAINT),
+                        ).min_size(egui::vec2(36.0, 28.0)));
+                        if min_r.clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                        btn_rects.push(min_r.rect);
+                    });
+                });
+
+                let (pressed, released, dbl, held) = ctx.input(|i| (
+                    i.pointer.button_pressed(egui::PointerButton::Primary),
+                    i.pointer.button_released(egui::PointerButton::Primary),
+                    i.pointer.button_double_clicked(egui::PointerButton::Primary),
+                    i.pointer.button_down(egui::PointerButton::Primary),
+                ));
+
+                if let Some(pos) = ctx.input(|i| i.pointer.interact_pos()) {
+                    let on_panel = panel_rect.contains(pos);
+                    let on_button = btn_rects.iter().any(|r| r.contains(pos));
+
+                    if dbl && on_panel && !on_button {
+                        let is_max = ctx.input(|i| i.viewport().maximized.unwrap_or(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!is_max));
+                        self.tb_press_pos = None;
+                    } else if pressed && on_panel && !on_button {
+                        self.tb_press_pos = Some(pos);
+                    } else if held && self.tb_press_pos.is_some() {
+                        let origin = self.tb_press_pos.unwrap();
+                        let dist = (pos - origin).length();
+                        if dist > 4.0 {
+                            self.tb_press_pos = None;
+                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                    }
+                }
+
+                if released || !held {
+                    self.tb_press_pos = None;
+                }
+            });
+    }
+
     fn draw_menu_bar(&mut self, ctx: &egui::Context) {
         if self.fullscreen {
             return;
         }
 
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("menu_bar")
+            .frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(6, 2))
+                .stroke(egui::Stroke::new(1.0, theme::BORDER)))
+            .show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Open...          Ctrl+O").clicked() {
@@ -566,10 +700,13 @@ impl CoveApp {
             return;
         }
 
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+        egui::TopBottomPanel::top("toolbar")
+            .frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(12, 8))
+                .stroke(egui::Stroke::new(1.0, theme::BORDER)))
+            .show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
-                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.spacing_mut().button_padding = egui::vec2(9.0, 5.0);
+                ui.spacing_mut().item_spacing.x = 6.0;
 
                 if ui.button("\u{1F4C2} Open").clicked() {
                     self.open_file_dialog();
@@ -586,28 +723,17 @@ impl CoveApp {
 
                 ui.separator();
 
-                if ui
-                    .button("\u{1F50D}+")
-                    .on_hover_text("Zoom in (+)")
-                    .clicked()
-                {
+                if ui.button("\u{1F50D}+").on_hover_text("Zoom in (+)").clicked() {
                     self.viewer.zoom_in();
                 }
-                if ui
-                    .button("\u{1F50D}\u{2212}")
-                    .on_hover_text("Zoom out (-)")
-                    .clicked()
-                {
-                    self.viewer.zoom_out();
-                }
 
-                let zoom_text = format!("{:.0}%", self.viewer.zoom_percent());
+                let zoom_text = format!("{:.0}% \u{25BE}", self.viewer.zoom_percent());
                 egui::ComboBox::from_id_salt("zoom_combo")
                     .selected_text(&zoom_text)
-                    .width(60.0)
+                    .width(70.0)
                     .show_ui(ui, |ui| {
                         for &pct in &[10, 25, 33, 50, 66, 75, 100, 125, 150, 200, 300, 500] {
-                            if ui.selectable_label(false, format!("{pct} %")).clicked() {
+                            if ui.selectable_label(false, format!("{pct}%")).clicked() {
                                 self.viewer.set_zoom(pct as f32 / 100.0);
                             }
                         }
@@ -623,10 +749,14 @@ impl CoveApp {
                         }
                     });
 
-                if ui.button("Fit").on_hover_text("Fit to window (0)").clicked() {
+                if ui.button("\u{1F50D}\u{2212}").on_hover_text("Zoom out (-)").clicked() {
+                    self.viewer.zoom_out();
+                }
+
+                if ui.button("\u{2922} Fit").on_hover_text("Fit to window (0)").clicked() {
                     self.viewer.set_fit_mode(FitMode::FitWindow);
                 }
-                if ui.button("1:1").on_hover_text("Actual size (1)").clicked() {
+                if ui.button("\u{1D7D9} 1:1").on_hover_text("Actual size (1)").clicked() {
                     self.viewer.set_fit_mode(FitMode::ActualSize);
                 }
 
@@ -640,14 +770,14 @@ impl CoveApp {
                     .unwrap_or(false);
 
                 if ui
-                    .add_enabled(has_selection, egui::Button::new("Crop"))
+                    .add_enabled(has_selection, egui::Button::new("\u{2702} Crop"))
                     .on_hover_text("Crop to selection (Ctrl+Y)")
                     .clicked()
                 {
                     self.pending_crop = true;
                 }
                 if ui
-                    .add_enabled(has_selection, egui::Button::new("\u{1F50D}Sel"))
+                    .add_enabled(has_selection, egui::Button::new("\u{1F50D}\u{2610}"))
                     .on_hover_text("Zoom to selection")
                     .clicked()
                 {
@@ -657,31 +787,19 @@ impl CoveApp {
 
                 ui.separator();
 
-                if ui.button("\u{21BB}").on_hover_text("Rotate (R)").clicked() {
+                if ui.button("\u{21BB}").on_hover_text("Rotate right (R)").clicked() {
                     self.viewer.rotate_cw();
                 }
-                if ui
-                    .button("\u{2194}")
-                    .on_hover_text("Flip horizontal (H)")
-                    .clicked()
-                {
+                if ui.button("\u{2B0C}").on_hover_text("Flip horizontal (H)").clicked() {
                     self.viewer.flip_horizontal();
                 }
-                if ui
-                    .button("\u{2195}")
-                    .on_hover_text("Flip vertical (V)")
-                    .clicked()
-                {
+                if ui.button("\u{2B0D}").on_hover_text("Flip vertical (V)").clicked() {
                     self.viewer.flip_vertical();
                 }
 
                 ui.separator();
 
-                if ui
-                    .button("\u{26F6}")
-                    .on_hover_text("Fullscreen (F11)")
-                    .clicked()
-                {
+                if ui.button("\u{26F6}").on_hover_text("Fullscreen (F11)").clicked() {
                     self.fullscreen = !self.fullscreen;
                 }
 
@@ -706,55 +824,69 @@ impl CoveApp {
             return;
         }
 
-        egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
+        egui::TopBottomPanel::bottom("status_bar")
+            .frame(egui::Frame::new().fill(theme::SURFACE).inner_margin(egui::Margin::symmetric(12, 4))
+                .stroke(egui::Stroke::new(1.0, theme::BORDER)))
+            .show(ctx, |ui| {
             ui.horizontal(|ui| {
+                let dot_rect = ui.allocate_space(egui::vec2(8.0, 8.0));
+                ui.painter().circle_filled(
+                    dot_rect.1.center(),
+                    3.0,
+                    theme::ACCENT_2,
+                );
+
+                ui.add_space(4.0);
+
                 if self.current_texture.is_none() && self.error.is_none() {
-                    ui.label("No image loaded \u{2014} Ctrl+O to open, or drag & drop");
+                    ui.colored_label(theme::TEXT_DIM, "No image loaded \u{2014} Ctrl+O to open, or drag & drop");
                     return;
                 }
 
                 if let Some((path, msg)) = &self.error {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                    ui.colored_label(egui::Color32::RED, format!("{name}: {msg}"));
+                    ui.colored_label(theme::DANGER, format!("{name}: {msg}"));
                     ui.separator();
-                    ui.label(self.browser.position_label());
+                    ui.colored_label(theme::TEXT_DIM, self.browser.position_label());
                     return;
                 }
 
                 if let Some(path) = &self.current_path {
                     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
-                    ui.label(name);
+                    ui.colored_label(theme::TEXT, name);
                     ui.separator();
-                    ui.label(format!(
-                        "{}x{}",
+                    ui.colored_label(theme::TEXT_DIM, format!(
+                        "{} \u{00D7} {}",
                         self.current_image_size.x as u32,
                         self.current_image_size.y as u32
                     ));
                     ui.separator();
-                    ui.label(&self.current_format);
+                    ui.colored_label(theme::ACCENT, &self.current_format);
                     ui.separator();
-                    ui.label(decoder::format_file_size(self.current_file_size));
+                    ui.colored_label(theme::TEXT_DIM, decoder::format_file_size(self.current_file_size));
                     ui.separator();
-                    ui.label(format!("{:.0}%", self.viewer.zoom_percent()));
-                    ui.separator();
-                    ui.label(self.browser.position_label());
+                    ui.colored_label(theme::TEXT_DIM, format!("zoom {:.0}%", self.viewer.zoom_percent()));
 
-                    if let Some(sel) = &self.viewer.selection {
-                        if sel.is_significant() {
-                            let r = sel.rect();
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.colored_label(theme::TEXT_DIM, self.browser.position_label());
+
+                        if self.slideshow_active {
                             ui.separator();
-                            ui.label(format!(
-                                "Sel: {:.0}x{:.0}",
-                                r.width(),
-                                r.height()
-                            ));
+                            ui.colored_label(theme::ACCENT_2, "\u{25B6} Slideshow");
                         }
-                    }
 
-                    if self.slideshow_active {
-                        ui.separator();
-                        ui.label("\u{25B6} Slideshow");
-                    }
+                        if let Some(sel) = &self.viewer.selection {
+                            if sel.is_significant() {
+                                let r = sel.rect();
+                                ui.separator();
+                                ui.colored_label(theme::ACCENT, format!(
+                                    "Sel: {:.0}\u{00D7}{:.0}",
+                                    r.width(),
+                                    r.height()
+                                ));
+                            }
+                        }
+                    });
                 }
             });
         });
@@ -762,7 +894,7 @@ impl CoveApp {
 
     fn draw_canvas(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(egui::Color32::from_rgb(26, 26, 26)))
+            .frame(egui::Frame::NONE.fill(theme::CANVAS_BG))
             .show(ctx, |ui| {
                 if let Some(ref texture) = self.current_texture {
                     let tex = texture.clone();
@@ -774,14 +906,41 @@ impl CoveApp {
                     }
                 } else if let Some((_, msg)) = &self.error {
                     ui.centered_and_justified(|ui| {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(255, 100, 100),
-                            format!("Failed to load: {msg}"),
-                        );
+                        ui.colored_label(theme::DANGER, format!("Failed to load: {msg}"));
                     });
                 } else {
-                    ui.centered_and_justified(|ui| {
-                        ui.heading("Drop an image here or press Ctrl+O");
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(ui.available_rect_before_wrap()), |ui| {
+                        ui.vertical_centered(|ui| {
+                            let avail = ui.available_height();
+                            ui.add_space(avail * 0.3);
+                            ui.label(
+                                egui::RichText::new("Drop an image to open")
+                                    .size(17.0)
+                                    .color(theme::TEXT),
+                            );
+                            ui.add_space(4.0);
+                            ui.label(
+                                egui::RichText::new("Cove opens virtually anything \u{2014} drag a file in, or browse your disk.")
+                                    .size(12.5)
+                                    .color(theme::TEXT_DIM),
+                            );
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new("\u{2014} OR \u{2014}")
+                                    .size(10.0)
+                                    .color(theme::TEXT_FAINT),
+                            );
+                            ui.add_space(10.0);
+                            if ui.button("\u{1F4C2} Open image\u{2026}").clicked() {
+                                self.open_file_dialog();
+                            }
+                            ui.add_space(12.0);
+                            ui.label(
+                                egui::RichText::new("JPG \u{00B7} PNG \u{00B7} GIF \u{00B7} WebP \u{00B7} AVIF \u{00B7} HEIC \u{00B7} SVG \u{00B7} PSD \u{00B7} TIFF \u{00B7} RAW \u{00B7} JXL \u{00B7} JP2 \u{00B7} ICO \u{00B7} BMP \u{00B7} QOI \u{00B7} EXR \u{00B7} and 30 more")
+                                    .size(10.0)
+                                    .color(theme::TEXT_FAINT),
+                            );
+                        });
                     });
                 }
             });
@@ -866,29 +1025,138 @@ impl CoveApp {
         }
 
         if self.show_about {
-            let mut open = self.show_about;
-            egui::Window::new("About Cove Image Viewer")
-                .open(&mut open)
-                .resizable(false)
+            let screen = ctx.screen_rect();
+            let backdrop_layer = egui::LayerId::new(egui::Order::Middle, egui::Id::new("about_backdrop"));
+            let painter = ctx.layer_painter(backdrop_layer);
+            painter.rect_filled(screen, 0.0, egui::Color32::from_black_alpha(160));
+
+            let card_width = 380.0;
+            egui::Area::new(egui::Id::new("about_area"))
+                .order(egui::Order::Foreground)
                 .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                 .show(ctx, |ui| {
-                    ui.heading("Cove Image Viewer");
-                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
-                    ui.add_space(4.0);
-                    ui.label("The VLC of image viewers \u{2014} opens every image.");
-                    ui.add_space(4.0);
-                    ui.label("45+ image formats supported.");
-                    ui.label("Built with Rust and egui.");
-                    ui.add_space(8.0);
-                    ui.label("License: AGPL-3.0");
+                    egui::Frame::new()
+                        .fill(theme::BG)
+                        .stroke(egui::Stroke::new(1.0, theme::BORDER_STRONG))
+                        .corner_radius(14.0)
+                        .inner_margin(egui::Margin::same(0))
+                        .shadow(egui::epaint::Shadow {
+                            offset: [0, 20],
+                            blur: 60,
+                            spread: 0,
+                            color: egui::Color32::from_black_alpha(200),
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(card_width);
+
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                ui.add_space(12.0);
+                                if let Some(tex) = &self.icon_texture {
+                                    ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(22.0, 22.0)));
+                                }
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("About").size(13.0).color(theme::TEXT).strong());
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    ui.add_space(6.0);
+                                    if ui.add(egui::Button::new(
+                                        egui::RichText::new("x").size(15.0).color(theme::TEXT_FAINT),
+                                    ).min_size(egui::vec2(32.0, 28.0))).clicked() {
+                                        self.show_about = false;
+                                    }
+                                });
+                            });
+                            ui.add_space(2.0);
+
+                            ui.add_space(2.0);
+                            let sep_rect = egui::Rect::from_min_size(
+                                egui::pos2(ui.min_rect().left(), ui.cursor().top()),
+                                egui::vec2(card_width, 1.0),
+                            );
+                            ui.painter().rect_filled(sep_rect, 0.0, theme::BORDER);
+                            ui.add_space(3.0);
+
+                            ui.vertical_centered(|ui| {
+                                ui.set_max_width(card_width - 40.0);
+                                ui.add_space(12.0);
+
+                                if let Some(tex) = &self.icon_texture {
+                                    ui.add(egui::Image::new(tex).fit_to_exact_size(egui::vec2(72.0, 72.0)));
+                                }
+
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new("Cove Image Viewer").size(19.0).strong().color(theme::TEXT));
+                                ui.add_space(6.0);
+
+                                let pill_w = 100.0;
+                                let pill_h = 22.0;
+                                let (pill_rect, _) = ui.allocate_exact_size(egui::vec2(pill_w, pill_h), egui::Sense::hover());
+                                ui.painter().rect_filled(pill_rect, 12.0, theme::ACCENT_SOFT);
+                                ui.painter().rect_stroke(pill_rect, 12.0, egui::Stroke::new(1.0, theme::ACCENT_RING), egui::StrokeKind::Outside);
+                                ui.painter().text(pill_rect.center(), egui::Align2::CENTER_CENTER, "Version 1.0.0", egui::FontId::proportional(11.5), theme::ACCENT);
+
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new("\u{201C}The VLC of image viewers.\u{201D}").italics().size(13.0));
+                                ui.add_space(2.0);
+                                ui.label(egui::RichText::new("Opens every image. 45+ formats, one window.").color(theme::TEXT_DIM).size(12.0));
+
+                                ui.add_space(12.0);
+
+                                let formats = [
+                                    "JPEG", "PNG", "GIF", "WebP", "AVIF", "HEIC", "HEIF",
+                                    "SVG", "PSD", "TIFF", "BMP", "ICO", "QOI", "EXR", "HDR",
+                                    "TGA", "DDS", "PNM", "JXL", "JP2", "PCX", "XBM", "XPM",
+                                    "SGI", "CR2", "NEF", "ARW", "DNG", "RAW", "farbfeld",
+                                ];
+
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.spacing_mut().item_spacing = egui::vec2(5.0, 5.0);
+                                    for fmt in &formats {
+                                        let btn = egui::Button::new(
+                                            egui::RichText::new(*fmt).color(theme::TEXT_DIM).size(9.5),
+                                        )
+                                        .fill(theme::SURFACE_2)
+                                        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+                                        .corner_radius(5.0)
+                                        .sense(egui::Sense::hover());
+                                        ui.add(btn);
+                                    }
+                                });
+
+                                ui.add_space(12.0);
+                                ui.label(egui::RichText::new("Built with Rust + egui \u{00B7} License AGPL-3.0").color(theme::TEXT_FAINT).size(10.5));
+                                ui.add_space(12.0);
+                            });
+                        });
                 });
-            self.show_about = open;
+
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.show_about = false;
+            }
         }
     }
 }
 
 impl eframe::App for CoveApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.icon_texture.is_none() {
+            let icon_bytes = include_bytes!("../docs/cove_icon.png");
+            if let Ok(img) = image::load_from_memory(icon_bytes) {
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let pixels: Vec<egui::Color32> = rgba
+                    .pixels()
+                    .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+                    .collect();
+                let color_image = egui::ColorImage { size, pixels };
+                self.icon_texture = Some(ctx.load_texture(
+                    "cove_icon",
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                ));
+            }
+        }
+
         if let Some(decoded) = self.pending_image.take() {
             let pixels_copy = decoded.pixels.clone();
             let texture = ctx.load_texture(
@@ -900,17 +1168,43 @@ impl eframe::App for CoveApp {
             self.current_pixels = Some(pixels_copy);
         }
 
+        if !self.anim_frames.is_empty() && self.anim_textures.is_empty() {
+            for (i, (pixels, _)) in self.anim_frames.iter().enumerate() {
+                let tex = ctx.load_texture(
+                    format!("anim_frame_{i}"),
+                    pixels.clone(),
+                    egui::TextureOptions::LINEAR,
+                );
+                self.anim_textures.push(tex);
+            }
+            if let Some(tex) = self.anim_textures.first() {
+                self.current_texture = Some(tex.clone());
+                self.current_pixels = Some(self.anim_frames[0].0.clone());
+            }
+            self.anim_index = 0;
+            self.anim_timer = 0.0;
+            ctx.request_repaint();
+        } else if self.anim_textures.len() > 1 {
+            let dt = ctx.input(|i| i.unstable_dt).min(0.1);
+            self.anim_timer += dt;
+            let delay_s = self.anim_frames[self.anim_index].1 as f32 / 1000.0;
+            if self.anim_timer >= delay_s {
+                self.anim_timer -= delay_s;
+                self.anim_index = (self.anim_index + 1) % self.anim_textures.len();
+                self.current_texture = Some(self.anim_textures[self.anim_index].clone());
+            }
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
+
         self.handle_dropped_files(ctx);
         self.handle_keys(ctx);
         self.update_slideshow(ctx);
 
-        if let Some(path) = &self.current_path {
-            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Cove");
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                "{name} \u{2014} Cove Image Viewer"
-            )));
-        }
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+            "Cove Image Viewer v1.0.0".to_string(),
+        ));
 
+        self.draw_titlebar(ctx);
         self.draw_menu_bar(ctx);
         self.draw_toolbar(ctx);
         self.draw_status_bar(ctx);
