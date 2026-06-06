@@ -1,4 +1,4 @@
-use crate::browser::Browser;
+use crate::browser::{Browser, SortMode};
 use crate::decoder::{self, DecodedImage};
 use crate::viewer::{FitMode, ViewerState};
 use egui::{TextureHandle, Vec2};
@@ -19,6 +19,12 @@ pub struct CoveApp {
     slideshow_active: bool,
     slideshow_interval: f32,
     slideshow_timer: f32,
+    canvas_rect: egui::Rect,
+    lock_zoom: bool,
+    always_on_top: bool,
+    show_about: bool,
+    show_image_info: bool,
+    confirm_delete: Option<PathBuf>,
 }
 
 impl CoveApp {
@@ -38,6 +44,12 @@ impl CoveApp {
             slideshow_active: false,
             slideshow_interval: 5.0,
             slideshow_timer: 0.0,
+            canvas_rect: egui::Rect::NOTHING,
+            lock_zoom: false,
+            always_on_top: false,
+            show_about: false,
+            show_image_info: false,
+            confirm_delete: None,
         };
 
         if let Some(p) = path {
@@ -61,7 +73,16 @@ impl CoveApp {
 
         match decoder::load_image(path) {
             Ok(decoded) => {
+                let locked_zoom = if self.lock_zoom {
+                    Some((self.viewer.zoom, self.viewer.fit_mode))
+                } else {
+                    None
+                };
                 self.viewer.reset_for_new_image();
+                if let Some((z, fm)) = locked_zoom {
+                    self.viewer.zoom = z;
+                    self.viewer.fit_mode = fm;
+                }
                 self.current_path = Some(path.to_path_buf());
                 self.current_image_size = Vec2::new(
                     decoded.original_width as f32,
@@ -76,6 +97,41 @@ impl CoveApp {
                 self.error = Some((path.to_path_buf(), e));
                 self.current_texture = None;
                 self.current_path = Some(path.to_path_buf());
+            }
+        }
+    }
+
+    fn copy_to_clipboard(&self) {
+        if let Some(path) = &self.current_path {
+            if let Ok(img) = image::open(path) {
+                let rgba = img.to_rgba8();
+                let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+                let img_data = arboard::ImageData {
+                    width: w,
+                    height: h,
+                    bytes: rgba.into_raw().into(),
+                };
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_image(img_data);
+                }
+            }
+        }
+    }
+
+    fn set_as_wallpaper(&self) {
+        if let Some(path) = &self.current_path {
+            if let Some(path_str) = path.to_str() {
+                let _ = wallpaper::set_from_path(path_str);
+            }
+        }
+    }
+
+    fn delete_current_file(&mut self) {
+        if let Some(path) = &self.current_path {
+            let path = path.clone();
+            if std::fs::remove_file(&path).is_ok() {
+                self.browser.remove_current();
+                self.load_current();
             }
         }
     }
@@ -99,7 +155,8 @@ impl CoveApp {
                 &[
                     "jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "svg", "ico",
                     "psd", "jxl", "qoi", "exr", "hdr", "tga", "dds", "pnm", "ppm", "pgm",
-                    "pbm", "ff", "cr2", "nef", "arw", "dng",
+                    "pbm", "ff", "cr2", "nef", "arw", "dng", "heic", "heif", "avif",
+                    "jp2", "j2k", "pcx", "xbm", "xpm", "sgi",
                 ],
             )
             .add_filter("All files", &["*"])
@@ -128,6 +185,9 @@ impl CoveApp {
         let mut toggle_fullscreen = false;
         let mut open_dialog = false;
         let mut zoom_out = false;
+        let mut crop_to_selection = false;
+        let mut copy_to_clip = false;
+        let mut delete_file = false;
         let mut text_actions: Vec<String> = Vec::new();
 
         ctx.input(|i| {
@@ -147,7 +207,9 @@ impl CoveApp {
                 toggle_fullscreen = true;
             }
             if i.key_pressed(egui::Key::Escape) {
-                if self.slideshow_active {
+                if self.viewer.selection.is_some() {
+                    self.viewer.clear_selection();
+                } else if self.slideshow_active {
                     self.slideshow_active = false;
                 } else if self.fullscreen {
                     toggle_fullscreen = true;
@@ -158,6 +220,15 @@ impl CoveApp {
             }
             if i.modifiers.ctrl && i.key_pressed(egui::Key::O) {
                 open_dialog = true;
+            }
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::Y) {
+                crop_to_selection = true;
+            }
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::C) {
+                copy_to_clip = true;
+            }
+            if i.key_pressed(egui::Key::Delete) {
+                delete_file = true;
             }
 
             for event in &i.events {
@@ -188,6 +259,18 @@ impl CoveApp {
         if open_dialog {
             self.open_file_dialog();
         }
+        if crop_to_selection {
+            self.viewer
+                .zoom_to_selection(self.current_image_size, self.canvas_rect);
+        }
+        if copy_to_clip {
+            self.copy_to_clipboard();
+        }
+        if delete_file {
+            if let Some(p) = &self.current_path {
+                self.confirm_delete = Some(p.clone());
+            }
+        }
 
         for t in &text_actions {
             match t.as_str() {
@@ -197,6 +280,7 @@ impl CoveApp {
                 "f" => self.viewer.cycle_fit_mode(),
                 "i" => self.show_info = !self.show_info,
                 "r" => self.viewer.rotate_cw(),
+                "l" => self.viewer.rotate_ccw(),
                 "h" => self.viewer.flip_horizontal(),
                 "v" => self.viewer.flip_vertical(),
                 "s" => {
@@ -225,6 +309,286 @@ impl CoveApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
+    fn draw_menu_bar(&mut self, ctx: &egui::Context) {
+        if self.fullscreen {
+            return;
+        }
+
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open...          Ctrl+O").clicked() {
+                        self.open_file_dialog();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Slideshow             S").clicked() {
+                        self.slideshow_active = !self.slideshow_active;
+                        self.slideshow_timer = 0.0;
+                        if self.slideshow_active { self.fullscreen = true; }
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    let del_enabled = self.current_path.is_some();
+                    if ui.add_enabled(del_enabled, egui::Button::new("Delete File         Del")).clicked() {
+                        if let Some(p) = &self.current_path {
+                            self.confirm_delete = Some(p.clone());
+                        }
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Exit                Esc").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+
+                ui.menu_button("Edit", |ui| {
+                    if ui.button("Copy              Ctrl+C").clicked() {
+                        self.copy_to_clipboard();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    let has_sel = self.viewer.selection.as_ref().map(|s| s.is_significant()).unwrap_or(false);
+                    if ui.add_enabled(has_sel, egui::Button::new("Crop View        Ctrl+Y")).clicked() {
+                        self.viewer.zoom_to_selection(self.current_image_size, self.canvas_rect);
+                        ui.close_menu();
+                    }
+                    if ui.button("Clear Selection     Esc").clicked() {
+                        self.viewer.clear_selection();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Set as Wallpaper").clicked() {
+                        self.set_as_wallpaper();
+                        ui.close_menu();
+                    }
+                });
+
+                ui.menu_button("Image", |ui| {
+                    if ui.button("Information           I").clicked() {
+                        self.show_image_info = !self.show_image_info;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Rotate Left           L").clicked() {
+                        self.viewer.rotate_ccw();
+                        ui.close_menu();
+                    }
+                    if ui.button("Rotate Right          R").clicked() {
+                        self.viewer.rotate_cw();
+                        ui.close_menu();
+                    }
+                    if ui.button("Flip Horizontal       H").clicked() {
+                        self.viewer.flip_horizontal();
+                        ui.close_menu();
+                    }
+                    if ui.button("Flip Vertical         V").clicked() {
+                        self.viewer.flip_vertical();
+                        ui.close_menu();
+                    }
+                });
+
+                ui.menu_button("View", |ui| {
+                    if ui.button("Full Screen         F11").clicked() {
+                        self.fullscreen = !self.fullscreen;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Zoom In               +").clicked() {
+                        self.viewer.zoom_in();
+                        ui.close_menu();
+                    }
+                    if ui.button("Zoom Out              -").clicked() {
+                        self.viewer.zoom_out();
+                        ui.close_menu();
+                    }
+                    if ui.button("Fit to Window         0").clicked() {
+                        self.viewer.set_fit_mode(FitMode::FitWindow);
+                        ui.close_menu();
+                    }
+                    if ui.button("Original Size         1").clicked() {
+                        self.viewer.set_fit_mode(FitMode::ActualSize);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.checkbox(&mut self.lock_zoom, "Lock Zoom").changed() {
+                        ui.close_menu();
+                    }
+                    if ui.checkbox(&mut self.always_on_top, "Always on Top").changed() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(
+                            if self.always_on_top {
+                                egui::WindowLevel::AlwaysOnTop
+                            } else {
+                                egui::WindowLevel::Normal
+                            },
+                        ));
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    ui.menu_button("Sort Files", |ui| {
+                        let current = self.browser.sort_mode;
+                        if ui.selectable_label(current == SortMode::Name, "By Name").clicked() {
+                            self.browser.sort_by(SortMode::Name);
+                            ui.close_menu();
+                        }
+                        if ui.selectable_label(current == SortMode::DateModified, "By Date Modified").clicked() {
+                            self.browser.sort_by(SortMode::DateModified);
+                            ui.close_menu();
+                        }
+                        if ui.selectable_label(current == SortMode::Size, "By Size").clicked() {
+                            self.browser.sort_by(SortMode::Size);
+                            ui.close_menu();
+                        }
+                        if ui.selectable_label(current == SortMode::Extension, "By Extension").clicked() {
+                            self.browser.sort_by(SortMode::Extension);
+                            ui.close_menu();
+                        }
+                    });
+                });
+
+                ui.menu_button("Help", |ui| {
+                    if ui.button("About Cove").clicked() {
+                        self.show_about = !self.show_about;
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
+    }
+
+    fn draw_toolbar(&mut self, ctx: &egui::Context) {
+        if self.fullscreen {
+            return;
+        }
+
+        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().button_padding = egui::vec2(6.0, 3.0);
+                ui.spacing_mut().item_spacing.x = 2.0;
+
+                if ui.button("\u{1F4C2} Open").clicked() {
+                    self.open_file_dialog();
+                }
+
+                ui.separator();
+
+                if ui.button("\u{25C0}").on_hover_text("Previous (Left)").clicked() {
+                    self.navigate(false);
+                }
+                if ui.button("\u{25B6}").on_hover_text("Next (Right)").clicked() {
+                    self.navigate(true);
+                }
+
+                ui.separator();
+
+                if ui
+                    .button("\u{1F50D}+")
+                    .on_hover_text("Zoom in (+)")
+                    .clicked()
+                {
+                    self.viewer.zoom_in();
+                }
+                if ui
+                    .button("\u{1F50D}\u{2212}")
+                    .on_hover_text("Zoom out (-)")
+                    .clicked()
+                {
+                    self.viewer.zoom_out();
+                }
+
+                let zoom_text = format!("{:.0}%", self.viewer.zoom_percent());
+                egui::ComboBox::from_id_salt("zoom_combo")
+                    .selected_text(&zoom_text)
+                    .width(60.0)
+                    .show_ui(ui, |ui| {
+                        for &pct in &[10, 25, 33, 50, 66, 75, 100, 125, 150, 200, 300, 500] {
+                            if ui.selectable_label(false, format!("{pct} %")).clicked() {
+                                self.viewer.set_zoom(pct as f32 / 100.0);
+                            }
+                        }
+                        ui.separator();
+                        if ui.selectable_label(false, "Fit to window").clicked() {
+                            self.viewer.set_fit_mode(FitMode::FitWindow);
+                        }
+                        if ui.selectable_label(false, "Fit width").clicked() {
+                            self.viewer.set_fit_mode(FitMode::FitWidth);
+                        }
+                        if ui.selectable_label(false, "Fit height").clicked() {
+                            self.viewer.set_fit_mode(FitMode::FitHeight);
+                        }
+                    });
+
+                if ui.button("Fit").on_hover_text("Fit to window (0)").clicked() {
+                    self.viewer.set_fit_mode(FitMode::FitWindow);
+                }
+                if ui.button("1:1").on_hover_text("Actual size (1)").clicked() {
+                    self.viewer.set_fit_mode(FitMode::ActualSize);
+                }
+
+                ui.separator();
+
+                let has_selection = self
+                    .viewer
+                    .selection
+                    .as_ref()
+                    .map(|s| s.is_significant())
+                    .unwrap_or(false);
+
+                if ui
+                    .add_enabled(has_selection, egui::Button::new("Crop View"))
+                    .on_hover_text("Zoom to selection (Ctrl+Y)")
+                    .clicked()
+                {
+                    self.viewer
+                        .zoom_to_selection(self.current_image_size, self.canvas_rect);
+                }
+
+                ui.separator();
+
+                if ui.button("\u{21BB}").on_hover_text("Rotate (R)").clicked() {
+                    self.viewer.rotate_cw();
+                }
+                if ui
+                    .button("\u{2194}")
+                    .on_hover_text("Flip horizontal (H)")
+                    .clicked()
+                {
+                    self.viewer.flip_horizontal();
+                }
+                if ui
+                    .button("\u{2195}")
+                    .on_hover_text("Flip vertical (V)")
+                    .clicked()
+                {
+                    self.viewer.flip_vertical();
+                }
+
+                ui.separator();
+
+                if ui
+                    .button("\u{26F6}")
+                    .on_hover_text("Fullscreen (F11)")
+                    .clicked()
+                {
+                    self.fullscreen = !self.fullscreen;
+                }
+
+                let slideshow_label = if self.slideshow_active {
+                    "\u{25A0} Stop"
+                } else {
+                    "\u{25B6} Slideshow"
+                };
+                if ui.button(slideshow_label).on_hover_text("Slideshow (S)").clicked() {
+                    self.slideshow_active = !self.slideshow_active;
+                    self.slideshow_timer = 0.0;
+                    if self.slideshow_active {
+                        self.fullscreen = true;
+                    }
+                }
+            });
+        });
+    }
+
     fn draw_status_bar(&self, ctx: &egui::Context) {
         if self.fullscreen && !self.show_info {
             return;
@@ -233,7 +597,7 @@ impl CoveApp {
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 if self.current_texture.is_none() && self.error.is_none() {
-                    ui.label("No image loaded — Ctrl+O to open, or drag & drop");
+                    ui.label("No image loaded \u{2014} Ctrl+O to open, or drag & drop");
                     return;
                 }
 
@@ -262,9 +626,22 @@ impl CoveApp {
                     ui.label(format!("{:.0}%", self.viewer.zoom_percent()));
                     ui.separator();
                     ui.label(self.browser.position_label());
+
+                    if let Some(sel) = &self.viewer.selection {
+                        if sel.is_significant() {
+                            let r = sel.rect();
+                            ui.separator();
+                            ui.label(format!(
+                                "Sel: {:.0}x{:.0}",
+                                r.width(),
+                                r.height()
+                            ));
+                        }
+                    }
+
                     if self.slideshow_active {
                         ui.separator();
-                        ui.label("▶ Slideshow");
+                        ui.label("\u{25B6} Slideshow");
                     }
                 }
             });
@@ -278,7 +655,7 @@ impl CoveApp {
                 if let Some(ref texture) = self.current_texture {
                     let tex = texture.clone();
                     let size = self.current_image_size;
-                    self.viewer.paint(ui, &tex, size);
+                    self.canvas_rect = self.viewer.paint(ui, &tex, size);
                 } else if let Some((_, msg)) = &self.error {
                     ui.centered_and_justified(|ui| {
                         ui.colored_label(
@@ -292,6 +669,105 @@ impl CoveApp {
                     });
                 }
             });
+    }
+
+    fn draw_dialogs(&mut self, ctx: &egui::Context) {
+        if let Some(path) = self.confirm_delete.clone() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file").to_string();
+            egui::Window::new("Delete File")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("Delete \"{name}\"?"));
+                    ui.label("This cannot be undone.");
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui.button("Delete").clicked() {
+                            self.confirm_delete = None;
+                            self.delete_current_file();
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.confirm_delete = None;
+                        }
+                    });
+                });
+        }
+
+        if self.show_image_info {
+            if let Some(path) = &self.current_path {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_string();
+                let dir = path.parent().map(|p| p.display().to_string()).unwrap_or_default();
+                let w = self.current_image_size.x as u32;
+                let h = self.current_image_size.y as u32;
+                let fmt = self.current_format.clone();
+                let size = decoder::format_file_size(self.current_file_size);
+                let modified = std::fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| {
+                        let dur = t.duration_since(std::time::UNIX_EPOCH).ok()?;
+                        let secs = dur.as_secs();
+                        Some(format_timestamp(secs))
+                    })
+                    .unwrap_or_else(|| "Unknown".to_string());
+
+                let mut open = self.show_image_info;
+                egui::Window::new("Image Information")
+                    .open(&mut open)
+                    .resizable(false)
+                    .default_width(350.0)
+                    .show(ctx, |ui| {
+                        egui::Grid::new("info_grid").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+                            ui.label("File:");
+                            ui.label(&name);
+                            ui.end_row();
+                            ui.label("Directory:");
+                            ui.label(&dir);
+                            ui.end_row();
+                            ui.label("Dimensions:");
+                            ui.label(format!("{w} x {h} pixels"));
+                            ui.end_row();
+                            ui.label("Format:");
+                            ui.label(&fmt);
+                            ui.end_row();
+                            ui.label("File Size:");
+                            ui.label(&size);
+                            ui.end_row();
+                            ui.label("Modified:");
+                            ui.label(&modified);
+                            ui.end_row();
+                            ui.label("Zoom:");
+                            ui.label(format!("{:.1}%", self.viewer.zoom_percent()));
+                            ui.end_row();
+                            ui.label("Position:");
+                            ui.label(self.browser.position_label());
+                            ui.end_row();
+                        });
+                    });
+                self.show_image_info = open;
+            }
+        }
+
+        if self.show_about {
+            let mut open = self.show_about;
+            egui::Window::new("About Cove Image Viewer")
+                .open(&mut open)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.heading("Cove Image Viewer");
+                    ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+                    ui.add_space(4.0);
+                    ui.label("The VLC of image viewers \u{2014} opens everything.");
+                    ui.add_space(4.0);
+                    ui.label("45+ image formats supported.");
+                    ui.label("Built with Rust and egui.");
+                    ui.add_space(8.0);
+                    ui.label("License: AGPL-3.0");
+                });
+            self.show_about = open;
+        }
     }
 }
 
@@ -313,11 +789,38 @@ impl eframe::App for CoveApp {
         if let Some(path) = &self.current_path {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("Cove");
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(format!(
-                "{name} — Cove Image Viewer"
+                "{name} \u{2014} Cove Image Viewer"
             )));
         }
 
+        self.draw_menu_bar(ctx);
+        self.draw_toolbar(ctx);
         self.draw_status_bar(ctx);
         self.draw_canvas(ctx);
+        self.draw_dialogs(ctx);
     }
+}
+
+fn format_timestamp(secs: u64) -> String {
+    let days = secs / 86400;
+    let remaining = secs % 86400;
+    let hours = remaining / 3600;
+    let minutes = (remaining % 3600) / 60;
+    let mut y = 1970u64;
+    let mut d = days;
+    loop {
+        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+        if d < days_in_year { break; }
+        d -= days_in_year;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let month_days = [31, if leap {29} else {28}, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0;
+    for md in &month_days {
+        if d < *md as u64 { break; }
+        d -= *md as u64;
+        m += 1;
+    }
+    format!("{y}-{:02}-{:02} {:02}:{:02}", m + 1, d + 1, hours, minutes)
 }
