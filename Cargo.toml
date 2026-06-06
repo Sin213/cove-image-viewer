@@ -24,6 +24,10 @@ pcx = "0.2"
 heic = { version = "0.1", features = ["av1"] }
 openjp2 = "0.6"
 
+# Clipboard and OS integration
+arboard = "3"
+wallpaper = "3"
+
 [features]
 default = []
 

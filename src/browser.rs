@@ -1,5 +1,13 @@
 use std::path::{Path, PathBuf};
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum SortMode {
+    Name,
+    DateModified,
+    Size,
+    Extension,
+}
+
 const SUPPORTED_EXTENSIONS: &[&str] = &[
     // Tier 1: image crate (JPEG, PNG, GIF, BMP, TIFF, WebP, ICO, QOI, EXR, HDR, TGA, DDS, PNM, farbfeld)
     "jpg", "jpeg", "jpe", "jfif", "png", "apng", "gif", "bmp", "dib", "tif", "tiff", "webp",
@@ -22,6 +30,7 @@ pub struct Browser {
     pub files: Vec<PathBuf>,
     pub index: usize,
     pub directory: Option<PathBuf>,
+    pub sort_mode: SortMode,
 }
 
 impl Browser {
@@ -30,6 +39,7 @@ impl Browser {
             files: Vec::new(),
             index: 0,
             directory: None,
+            sort_mode: SortMode::Name,
         }
     }
 
@@ -59,7 +69,7 @@ impl Browser {
             }
         }
 
-        self.files.sort_by(|a, b| natord_compare(a, b));
+        self.apply_sort();
     }
 
     fn is_supported(path: &Path) -> bool {
@@ -122,6 +132,48 @@ impl Browser {
             String::new()
         } else {
             format!("{}/{}", self.index + 1, self.files.len())
+        }
+    }
+
+    pub fn sort_by(&mut self, mode: SortMode) {
+        let current_file = self.current().map(|p| p.to_path_buf());
+        self.sort_mode = mode;
+        self.apply_sort();
+        if let Some(cf) = current_file {
+            if let Some(pos) = self.files.iter().position(|f| f == &cf) {
+                self.index = pos;
+            }
+        }
+    }
+
+    fn apply_sort(&mut self) {
+        match self.sort_mode {
+            SortMode::Name => self.files.sort_by(|a, b| natord_compare(a, b)),
+            SortMode::DateModified => self.files.sort_by(|a, b| {
+                let a_time = std::fs::metadata(a).and_then(|m| m.modified()).ok();
+                let b_time = std::fs::metadata(b).and_then(|m| m.modified()).ok();
+                a_time.cmp(&b_time)
+            }),
+            SortMode::Size => self.files.sort_by(|a, b| {
+                let a_size = std::fs::metadata(a).map(|m| m.len()).unwrap_or(0);
+                let b_size = std::fs::metadata(b).map(|m| m.len()).unwrap_or(0);
+                a_size.cmp(&b_size)
+            }),
+            SortMode::Extension => self.files.sort_by(|a, b| {
+                let a_ext = a.extension().and_then(|e| e.to_str()).unwrap_or("");
+                let b_ext = b.extension().and_then(|e| e.to_str()).unwrap_or("");
+                a_ext.to_lowercase().cmp(&b_ext.to_lowercase())
+            }),
+        }
+    }
+
+    pub fn remove_current(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+        self.files.remove(self.index);
+        if self.index >= self.files.len() && !self.files.is_empty() {
+            self.index = self.files.len() - 1;
         }
     }
 }
