@@ -240,6 +240,7 @@ impl CoveApp {
             Some(p) => p,
             None => return,
         };
+        let transformed = apply_transform(pixels, self.viewer.rotation, self.viewer.flip_h, self.viewer.flip_v);
         let name = self.current_path.as_ref()
             .and_then(|p| p.file_stem())
             .and_then(|s| s.to_str())
@@ -267,10 +268,10 @@ impl CoveApp {
                 .unwrap_or_default();
             if ext == "jpg" || ext == "jpeg" || ext == "png" {
                 self.save_as_format = ext;
-                self.save_as_pixels = Some(pixels.clone());
+                self.save_as_pixels = Some(transformed);
                 self.save_as_path = Some(path);
             } else {
-                save_image(pixels, &path);
+                save_image(&transformed, &path);
             }
         }
     }
@@ -537,6 +538,7 @@ impl CoveApp {
         }
         if toggle_fullscreen {
             self.fullscreen = !self.fullscreen;
+            self.viewer.clear_selection();
         }
         if zoom_out {
             self.viewer.zoom_out();
@@ -575,6 +577,7 @@ impl CoveApp {
                     self.slideshow_timer = 0.0;
                     if self.slideshow_active {
                         self.fullscreen = true;
+                        self.viewer.clear_selection();
                     }
                 }
                 "__save_as__" => if self.loading_path.is_none() { self.save_as_dialog() },
@@ -714,7 +717,7 @@ impl CoveApp {
                     if ui.button("Slideshow             S").clicked() {
                         self.slideshow_active = !self.slideshow_active;
                         self.slideshow_timer = 0.0;
-                        if self.slideshow_active { self.fullscreen = true; }
+                        if self.slideshow_active { self.fullscreen = true; self.viewer.clear_selection(); }
                         ui.close_menu();
                     }
                     ui.menu_button("Slideshow Interval", |ui| {
@@ -1008,6 +1011,7 @@ impl CoveApp {
                     self.slideshow_timer = 0.0;
                     if self.slideshow_active {
                         self.fullscreen = true;
+                        self.viewer.clear_selection();
                     }
                 }
             });

@@ -293,16 +293,20 @@ impl ViewerState {
 
         let response = ui.allocate_rect(canvas_rect, egui::Sense::click_and_drag());
 
-        // Left-click-drag: draw selection rectangle
+        // Left-click-drag: draw selection rectangle (clamped to image)
         if response.dragged_by(egui::PointerButton::Primary) {
             if let Some(pos) = response.interact_pointer_pos() {
+                let clamped = Pos2::new(
+                    pos.x.clamp(dest_rect.min.x, dest_rect.max.x),
+                    pos.y.clamp(dest_rect.min.y, dest_rect.max.y),
+                );
                 if self.drag_start.is_none() {
-                    self.drag_start = Some(pos);
+                    self.drag_start = Some(clamped);
                 }
                 if let Some(start) = self.drag_start {
                     self.selection = Some(Selection {
                         start,
-                        end: pos,
+                        end: clamped,
                     });
                 }
             }
