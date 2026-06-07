@@ -94,12 +94,14 @@ pub fn load_image(path: &Path) -> Result<DecodedImage, String> {
         _ => load_via_image_crate(path),
     };
 
-    // Fallback: if specific decoder fails, try image crate
+    // Fallback: if specific decoder fails, try image crate by extension, then by content
     match &result {
         Ok(_) => result,
         Err(specific_err) => {
-            load_via_image_crate(path).map_err(|img_err| {
-                format!("{specific_err} (fallback also failed: {img_err})")
+            load_via_image_crate(path).or_else(|_| {
+                load_by_content(path).map_err(|content_err| {
+                    format!("{specific_err} (fallback also failed: {content_err})")
+                })
             })
         }
     }
@@ -118,6 +120,15 @@ fn to_color_image(img: image::DynamicImage, format_name: &str) -> DecodedImage {
         original_width: width,
         original_height: height,
     }
+}
+
+fn load_by_content(path: &Path) -> Result<DecodedImage, String> {
+    let data = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
+    let format = image::guess_format(&data).map_err(|e| format!("detect: {e}"))?;
+    let img = image::load_from_memory_with_format(&data, format)
+        .map_err(|e| format!("decode: {e}"))?;
+    let format_name = format!("{format:?}");
+    Ok(to_color_image(img, &format_name))
 }
 
 fn load_via_image_crate(path: &Path) -> Result<DecodedImage, String> {
