@@ -8,49 +8,236 @@ on:
     branches: [main]
 
 jobs:
-  build:
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact: cove-image-viewer
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: cove-image-viewer.exe
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            artifact: cove-image-viewer
-
-    runs-on: ${{ matrix.os }}
-
+  build-linux:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
+      - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev libfuse2
 
+      - name: Build
+        run: cargo build --release
+
+      - name: Create .deb package
+        run: |
+          mkdir -p deb/DEBIAN
+          mkdir -p deb/usr/bin
+          mkdir -p deb/usr/share/applications
+          mkdir -p deb/usr/share/icons/hicolor/512x512/apps
+
+          cp target/release/cove-image-viewer deb/usr/bin/
+          cp docs/cove_icon.png deb/usr/share/icons/hicolor/512x512/apps/cove-image-viewer.png
+
+          cat > deb/usr/share/applications/cove-image-viewer.desktop << 'DESKTOP'
+          [Desktop Entry]
+          Name=Cove Image Viewer
+          Comment=The VLC of image viewers
+          Exec=cove-image-viewer %f
+          Icon=cove-image-viewer
+          Terminal=false
+          Type=Application
+          Categories=Graphics;Viewer;
+          MimeType=image/jpeg;image/png;image/gif;image/bmp;image/tiff;image/webp;image/svg+xml;image/avif;image/heic;image/heif;image/jxl;
+          StartupWMClass=cove-image-viewer
+          DESKTOP
+
+          cat > deb/DEBIAN/control << CONTROL
+          Package: cove-image-viewer
+          Version: 1.0.0
+          Section: graphics
+          Priority: optional
+          Architecture: amd64
+          Depends: libgtk-3-0, libxcb-render0, libxcb-shape0, libxcb-xfixes0
+          Maintainer: Sin <cjlopez213@gmail.com>
+          Description: The VLC of image viewers — opens every image
+           Fast cross-platform image viewer with 60+ format support.
+          CONTROL
+
+          dpkg-deb --build deb cove-image-viewer_1.0.0_amd64.deb
+
+      - name: Create AppImage
+        run: |
+          mkdir -p AppDir/usr/bin
+          mkdir -p AppDir/usr/share/applications
+          mkdir -p AppDir/usr/share/icons/hicolor/512x512/apps
+
+          cp target/release/cove-image-viewer AppDir/usr/bin/
+          cp docs/cove_icon.png AppDir/usr/share/icons/hicolor/512x512/apps/cove-image-viewer.png
+          cp docs/cove_icon.png AppDir/cove-image-viewer.png
+
+          cat > AppDir/usr/share/applications/cove-image-viewer.desktop << 'DESKTOP'
+          [Desktop Entry]
+          Name=Cove Image Viewer
+          Comment=The VLC of image viewers
+          Exec=cove-image-viewer %f
+          Icon=cove-image-viewer
+          Terminal=false
+          Type=Application
+          Categories=Graphics;Viewer;
+          StartupWMClass=cove-image-viewer
+          DESKTOP
+
+          cp AppDir/usr/share/applications/cove-image-viewer.desktop AppDir/
+
+          wget -q https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage -O appimagetool
+          chmod +x appimagetool
+
+          cat > AppDir/AppRun << 'APPRUN'
+          #!/bin/bash
+          SELF=$(readlink -f "$0")
+          HERE=${SELF%/*}
+          exec "${HERE}/usr/bin/cove-image-viewer" "$@"
+          APPRUN
+          chmod +x AppDir/AppRun
+
+          ARCH=x86_64 ./appimagetool AppDir Cove_Image_Viewer-x86_64.AppImage
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages
+          path: |
+            target/release/cove-image-viewer
+            cove-image-viewer_1.0.0_amd64.deb
+            Cove_Image_Viewer-x86_64.AppImage
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release
 
-      - name: Upload artifact
+      - name: Create Portable
+        shell: bash
+        run: |
+          cp target/release/cove-image-viewer.exe "Cove_Image_Viewer_Portable.exe"
+
+      - name: Create installer with Inno Setup
+        shell: bash
+        run: |
+          cat > setup.iss << 'ISS'
+          [Setup]
+          AppName=Cove Image Viewer
+          AppVersion=1.0.0
+          AppPublisher=Sin
+          DefaultDirName={autopf}\Cove Image Viewer
+          DefaultGroupName=Cove Image Viewer
+          OutputDir=.
+          OutputBaseFilename=Cove_Image_Viewer_Setup
+          Compression=lzma2
+          SolidCompression=yes
+          ArchitecturesInstallIn64BitMode=x64compatible
+          SetupIconFile=docs\cove_icon.ico
+          UninstallDisplayIcon={app}\cove-image-viewer.exe
+          ChangesAssociations=yes
+
+          [Files]
+          Source: "target\release\cove-image-viewer.exe"; DestDir: "{app}"; Flags: ignoreversion
+
+          [Icons]
+          Name: "{group}\Cove Image Viewer"; Filename: "{app}\cove-image-viewer.exe"
+          Name: "{commondesktop}\Cove Image Viewer"; Filename: "{app}\cove-image-viewer.exe"
+
+          [Run]
+          Filename: "{app}\cove-image-viewer.exe"; Description: "Launch Cove Image Viewer"; Flags: nowait postinstall skipifsilent
+          ISS
+
+          # Convert PNG to ICO for the installer
+          magick docs/cove_icon.png -resize 256x256 docs/cove_icon.ico 2>/dev/null || true
+
+          # Build installer (iscc is pre-installed on windows-latest)
+          iscc setup.iss || echo "Inno Setup not available, skipping installer"
+
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: cove-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/${{ matrix.artifact }}
+          name: windows-packages
+          path: |
+            Cove_Image_Viewer_Portable.exe
+            Cove_Image_Viewer_Setup.exe
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Create .app bundle
+        run: |
+          mkdir -p "Cove Image Viewer.app/Contents/MacOS"
+          mkdir -p "Cove Image Viewer.app/Contents/Resources"
+
+          cp target/aarch64-apple-darwin/release/cove-image-viewer "Cove Image Viewer.app/Contents/MacOS/"
+
+          # Create icns from png
+          mkdir -p icon.iconset
+          sips -z 16 16   docs/cove_icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32   docs/cove_icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32   docs/cove_icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64   docs/cove_icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128 docs/cove_icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256 docs/cove_icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256 docs/cove_icon.png --out icon.iconset/icon_256x256.png
+          sips -z 512 512 docs/cove_icon.png --out icon.iconset/icon_256x256@2x.png
+          sips -z 512 512 docs/cove_icon.png --out icon.iconset/icon_512x512.png
+          iconutil -c icns icon.iconset -o "Cove Image Viewer.app/Contents/Resources/AppIcon.icns"
+
+          cat > "Cove Image Viewer.app/Contents/Info.plist" << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleName</key>
+              <string>Cove Image Viewer</string>
+              <key>CFBundleDisplayName</key>
+              <string>Cove Image Viewer</string>
+              <key>CFBundleIdentifier</key>
+              <string>com.cove.image-viewer</string>
+              <key>CFBundleVersion</key>
+              <string>1.0.0</string>
+              <key>CFBundleShortVersionString</key>
+              <string>1.0.0</string>
+              <key>CFBundleExecutable</key>
+              <string>cove-image-viewer</string>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon</string>
+              <key>CFBundlePackageType</key>
+              <string>APPL</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+          </dict>
+          </plist>
+          PLIST
+
+      - name: Create DMG
+        run: |
+          hdiutil create -volname "Cove Image Viewer" -srcfolder "Cove Image Viewer.app" -ov -format UDZO Cove_Image_Viewer.dmg
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-packages
+          path: |
+            Cove_Image_Viewer.dmg
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -63,18 +250,20 @@ jobs:
       - name: Prepare release assets
         run: |
           mkdir -p release
-          cd artifacts
-          for dir in */; do
-            name="${dir%/}"
-            cd "$dir"
-            if [ -f "cove-image-viewer.exe" ]; then
-              cp cove-image-viewer.exe "../../release/${name}.exe"
-            else
-              cp cove-image-viewer "../../release/${name}"
-            fi
-            cd ..
-          done
-          cd ../release
+
+          # Linux
+          cp artifacts/linux-packages/target/release/cove-image-viewer release/cove-image-viewer-linux-x86_64
+          cp artifacts/linux-packages/cove-image-viewer_1.0.0_amd64.deb release/
+          cp artifacts/linux-packages/Cove_Image_Viewer-x86_64.AppImage release/
+
+          # Windows
+          cp artifacts/windows-packages/Cove_Image_Viewer_Portable.exe release/ 2>/dev/null || true
+          cp artifacts/windows-packages/Cove_Image_Viewer_Setup.exe release/ 2>/dev/null || true
+
+          # macOS
+          cp artifacts/macos-packages/Cove_Image_Viewer.dmg release/
+
+          cd release
           sha256sum * > checksums-sha256.txt
 
       - name: Create release

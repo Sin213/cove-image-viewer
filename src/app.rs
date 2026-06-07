@@ -601,6 +601,45 @@ impl CoveApp {
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
 
+    fn handle_window_resize(&self, ctx: &egui::Context) {
+        let rect = ctx.screen_rect();
+        let m = 5.0;
+
+        let pos = match ctx.input(|i| i.pointer.interact_pos()) {
+            Some(p) => p,
+            None => return,
+        };
+
+        let left = pos.x - rect.min.x < m;
+        let right = rect.max.x - pos.x < m;
+        let top = pos.y - rect.min.y < m;
+        let bottom = rect.max.y - pos.y < m;
+
+        let dir = match (left, right, top, bottom) {
+            (true, _, true, _) => Some(egui::ResizeDirection::NorthWest),
+            (_, true, true, _) => Some(egui::ResizeDirection::NorthEast),
+            (true, _, _, true) => Some(egui::ResizeDirection::SouthWest),
+            (_, true, _, true) => Some(egui::ResizeDirection::SouthEast),
+            (true, _, _, _) => Some(egui::ResizeDirection::West),
+            (_, true, _, _) => Some(egui::ResizeDirection::East),
+            (_, _, true, _) => Some(egui::ResizeDirection::North),
+            (_, _, _, true) => Some(egui::ResizeDirection::South),
+            _ => None,
+        };
+
+        if let Some(dir) = dir {
+            ctx.set_cursor_icon(match dir {
+                egui::ResizeDirection::North | egui::ResizeDirection::South => egui::CursorIcon::ResizeVertical,
+                egui::ResizeDirection::East | egui::ResizeDirection::West => egui::CursorIcon::ResizeHorizontal,
+                egui::ResizeDirection::NorthWest | egui::ResizeDirection::SouthEast => egui::CursorIcon::ResizeNwSe,
+                egui::ResizeDirection::NorthEast | egui::ResizeDirection::SouthWest => egui::CursorIcon::ResizeNeSw,
+            });
+            if ctx.input(|i| i.pointer.button_pressed(egui::PointerButton::Primary)) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(dir));
+            }
+        }
+    }
+
     fn draw_titlebar(&mut self, ctx: &egui::Context) {
         if self.fullscreen {
             return;
@@ -1482,7 +1521,8 @@ impl eframe::App for CoveApp {
         if self.icon_texture.is_none() {
             let icon_bytes = include_bytes!("../docs/cove_icon.png");
             if let Ok(img) = image::load_from_memory(icon_bytes) {
-                let rgba = img.to_rgba8();
+                let scaled = img.resize(64, 64, image::imageops::FilterType::Lanczos3);
+                let rgba = scaled.to_rgba8();
                 let size = [rgba.width() as usize, rgba.height() as usize];
                 let pixels: Vec<egui::Color32> = rgba
                     .pixels()
@@ -1573,6 +1613,10 @@ impl eframe::App for CoveApp {
         self.handle_dropped_files(ctx);
         self.handle_keys(ctx);
         self.update_slideshow(ctx);
+
+        if !self.fullscreen {
+            self.handle_window_resize(ctx);
+        }
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(
             "Cove Image Viewer v1.0.0".to_string(),

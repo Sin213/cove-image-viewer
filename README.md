@@ -6,6 +6,8 @@ A fast, cross-platform image viewer built in Rust with egui. Single binary with 
 
 Works on **Linux**, **Windows**, and **macOS**.
 
+![Cove Image Viewer](docs/cove-image.png)
+
 ## Supported Formats
 
 | Category | Formats |
