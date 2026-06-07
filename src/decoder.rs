@@ -354,11 +354,11 @@ fn load_raw(path: &Path) -> Result<DecodedImage, String> {
     })
 }
 
-// ─── PSD via psd crate ───
+// ─── PSD via psd crate, with manual composite fallback ───
 
 fn load_psd(path: &Path) -> Result<DecodedImage, String> {
     let data = std::fs::read(path).map_err(|e| format!("read: {e}"))?;
-    std::panic::catch_unwind(|| {
+    let crate_result = std::panic::catch_unwind(|| {
         let psd = psd::Psd::from_bytes(&data).map_err(|e| format!("psd: {e}"))?;
         let width = psd.width();
         let height = psd.height();
@@ -373,7 +373,201 @@ fn load_psd(path: &Path) -> Result<DecodedImage, String> {
             original_height: height,
         })
     })
-    .unwrap_or_else(|_| Err("psd: internal decoder panic".into()))
+    .unwrap_or_else(|_| Err("psd: internal decoder panic".into()));
+
+    if crate_result.is_ok() {
+        return crate_result;
+    }
+
+    load_psd_composite(&data)
+}
+
+/// Parse the flattened composite image stored at the end of a PSD/PSB file.
+fn load_psd_composite(data: &[u8]) -> Result<DecodedImage, String> {
+    use std::io::{Cursor, Read as _};
+    use byteorder::{BigEndian, ReadBytesExt};
+
+    let mut r = Cursor::new(data);
+
+    // ── Header ──
+    let mut sig = [0u8; 4];
+    r.read_exact(&mut sig).map_err(|e| format!("psd header: {e}"))?;
+    if &sig != b"8BPS" {
+        return Err("psd: not a PSD file".into());
+    }
+    let version = r.read_u16::<BigEndian>().map_err(|e| format!("psd version: {e}"))?;
+    if version != 1 && version != 2 {
+        return Err(format!("psd: unsupported version {version}"));
+    }
+    let mut _reserved = [0u8; 6];
+    r.read_exact(&mut _reserved).map_err(|e| format!("psd header: {e}"))?;
+    let channels = r.read_u16::<BigEndian>().map_err(|e| format!("psd header: {e}"))? as usize;
+    let height = r.read_u32::<BigEndian>().map_err(|e| format!("psd header: {e}"))? as usize;
+    let width = r.read_u32::<BigEndian>().map_err(|e| format!("psd header: {e}"))? as usize;
+    let depth = r.read_u16::<BigEndian>().map_err(|e| format!("psd header: {e}"))? as usize;
+    let color_mode = r.read_u16::<BigEndian>().map_err(|e| format!("psd header: {e}"))?;
+
+    if depth != 8 && depth != 16 {
+        return Err(format!("psd: unsupported bit depth {depth}"));
+    }
+
+    // ── Skip Color Mode Data ──
+    let section_len = read_section_len(&mut r, version)?;
+    skip(&mut r, section_len)?;
+
+    // ── Skip Image Resources ──
+    let section_len = read_section_len(&mut r, version)?;
+    skip(&mut r, section_len)?;
+
+    // ── Skip Layer and Mask Info ──
+    let section_len = read_section_len(&mut r, version)?;
+    skip(&mut r, section_len)?;
+
+    // ── Image Data (flattened composite) ──
+    let compression = r.read_u16::<BigEndian>().map_err(|e| format!("psd image data: {e}"))?;
+    let pixel_count = width * height;
+
+    let channel_data: Vec<Vec<u8>> = match compression {
+        0 => {
+            // Raw
+            let mut channels_vec = Vec::with_capacity(channels);
+            for _ in 0..channels {
+                let mut ch = vec![0u8; pixel_count * (depth / 8)];
+                r.read_exact(&mut ch).map_err(|e| format!("psd raw: {e}"))?;
+                channels_vec.push(ch);
+            }
+            channels_vec
+        }
+        1 => {
+            // RLE — byte counts per scanline per channel, then packed data
+            let mut _byte_counts = Vec::with_capacity(channels * height);
+            for _ in 0..(channels * height) {
+                let bc = if version == 1 {
+                    r.read_u16::<BigEndian>().map_err(|e| format!("psd rle: {e}"))? as usize
+                } else {
+                    r.read_u32::<BigEndian>().map_err(|e| format!("psd rle: {e}"))? as usize
+                };
+                _byte_counts.push(bc);
+            }
+            let mut channels_vec = Vec::with_capacity(channels);
+            for ch_idx in 0..channels {
+                let mut decoded = Vec::with_capacity(pixel_count * (depth / 8));
+                for row in 0..height {
+                    let count = _byte_counts[ch_idx * height + row];
+                    let mut packed = vec![0u8; count];
+                    r.read_exact(&mut packed).map_err(|e| format!("psd rle: {e}"))?;
+                    decode_packbits(&packed, &mut decoded);
+                }
+                channels_vec.push(decoded);
+            }
+            channels_vec
+        }
+        _ => return Err(format!("psd: unsupported compression {compression} (zip not implemented)")),
+    };
+
+    // ── Assemble RGBA ──
+    let mut rgba = vec![255u8; pixel_count * 4];
+    let scale16 = depth == 16;
+
+    match color_mode {
+        3 => {
+            // RGB
+            for i in 0..pixel_count {
+                rgba[i * 4]     = sample(&channel_data[0], i, scale16);
+                rgba[i * 4 + 1] = sample(&channel_data[1], i, scale16);
+                rgba[i * 4 + 2] = sample(&channel_data[2], i, scale16);
+                if channels >= 4 {
+                    rgba[i * 4 + 3] = sample(&channel_data[3], i, scale16);
+                }
+            }
+        }
+        1 => {
+            // Grayscale
+            for i in 0..pixel_count {
+                let v = sample(&channel_data[0], i, scale16);
+                rgba[i * 4]     = v;
+                rgba[i * 4 + 1] = v;
+                rgba[i * 4 + 2] = v;
+                if channels >= 2 {
+                    rgba[i * 4 + 3] = sample(&channel_data[1], i, scale16);
+                }
+            }
+        }
+        4 => {
+            // CMYK
+            for i in 0..pixel_count {
+                let c = sample(&channel_data[0], i, scale16) as f32 / 255.0;
+                let m = sample(&channel_data[1], i, scale16) as f32 / 255.0;
+                let y = sample(&channel_data[2], i, scale16) as f32 / 255.0;
+                let k = sample(&channel_data[3], i, scale16) as f32 / 255.0;
+                rgba[i * 4]     = (255.0 * (1.0 - c) * (1.0 - k)) as u8;
+                rgba[i * 4 + 1] = (255.0 * (1.0 - m) * (1.0 - k)) as u8;
+                rgba[i * 4 + 2] = (255.0 * (1.0 - y) * (1.0 - k)) as u8;
+                if channels >= 5 {
+                    rgba[i * 4 + 3] = sample(&channel_data[4], i, scale16);
+                }
+            }
+        }
+        _ => return Err(format!("psd: unsupported color mode {color_mode}")),
+    }
+
+    Ok(DecodedImage {
+        pixels: egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba),
+        format_name: "PSD".to_string(),
+        original_width: width as u32,
+        original_height: height as u32,
+    })
+}
+
+fn read_section_len(r: &mut std::io::Cursor<&[u8]>, version: u16) -> Result<u64, String> {
+    use byteorder::{BigEndian, ReadBytesExt};
+    if version == 1 {
+        r.read_u32::<BigEndian>().map(|v| v as u64).map_err(|e| format!("psd section: {e}"))
+    } else {
+        r.read_u64::<BigEndian>().map_err(|e| format!("psd section: {e}"))
+    }
+}
+
+fn skip(r: &mut std::io::Cursor<&[u8]>, n: u64) -> Result<(), String> {
+    let pos = r.position();
+    r.set_position(pos + n);
+    Ok(())
+}
+
+fn sample(ch: &[u8], i: usize, is_16bit: bool) -> u8 {
+    if is_16bit {
+        let off = i * 2;
+        if off + 1 < ch.len() {
+            (u16::from_be_bytes([ch[off], ch[off + 1]]) >> 8) as u8
+        } else {
+            0
+        }
+    } else if i < ch.len() {
+        ch[i]
+    } else {
+        0
+    }
+}
+
+fn decode_packbits(packed: &[u8], out: &mut Vec<u8>) {
+    let mut i = 0;
+    while i < packed.len() {
+        let n = packed[i] as i8;
+        i += 1;
+        if n >= 0 {
+            let count = n as usize + 1;
+            let end = (i + count).min(packed.len());
+            out.extend_from_slice(&packed[i..end]);
+            i = end;
+        } else if n > -128 {
+            let count = (-n) as usize + 1;
+            if i < packed.len() {
+                let val = packed[i];
+                i += 1;
+                out.extend(std::iter::repeat_n(val, count));
+            }
+        }
+    }
 }
 
 // ─── PCX ───

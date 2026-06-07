@@ -1078,6 +1078,7 @@ name = "cove-image-viewer"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "byteorder",
  "clap",
  "eframe",
  "egui",

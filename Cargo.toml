@@ -24,6 +24,9 @@ pcx = "0.2"
 heic = { version = "0.1", features = ["av1"] }
 openjp2 = "0.6"
 
+# PSD composite fallback parser
+byteorder = "1"
+
 # EXIF metadata
 kamadak-exif = "0.5"
 
