@@ -27,6 +27,14 @@ impl Selection {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ResizeEdge {
+    TopLeft, Top, TopRight,
+    Left, Right,
+    BottomLeft, Bottom, BottomRight,
+    Move,
+}
+
 pub struct ViewerState {
     pub zoom: f32,
     pub offset: Vec2,
@@ -36,6 +44,8 @@ pub struct ViewerState {
     pub flip_v: bool,
     pub selection: Option<Selection>,
     drag_start: Option<Pos2>,
+    resize_edge: Option<ResizeEdge>,
+    resize_origin: Option<Rect>,
     needs_fit: bool,
     min_zoom: f32,
     last_scaled: Vec2,
@@ -53,6 +63,8 @@ impl ViewerState {
             flip_v: false,
             selection: None,
             drag_start: None,
+            resize_edge: None,
+            resize_origin: None,
             needs_fit: true,
             min_zoom: 0.01,
             last_scaled: Vec2::ZERO,
@@ -70,6 +82,8 @@ impl ViewerState {
         self.flip_v = false;
         self.selection = None;
         self.drag_start = None;
+        self.resize_edge = None;
+        self.resize_origin = None;
     }
 
     pub fn zoom_percent(&self) -> f32 {
@@ -190,6 +204,8 @@ impl ViewerState {
     pub fn clear_selection(&mut self) {
         self.selection = None;
         self.drag_start = None;
+        self.resize_edge = None;
+        self.resize_origin = None;
     }
 
     pub fn zoom_to_selection(&mut self, image_size: Vec2, canvas_rect: Rect) {
@@ -293,27 +309,123 @@ impl ViewerState {
 
         let response = ui.allocate_rect(canvas_rect, egui::Sense::click_and_drag());
 
-        // Left-click-drag: draw selection rectangle (clamped to image)
+        // Left-click-drag: draw or resize selection rectangle
+        let grab = 20.0f32;
+
+        // Detect which edge/corner the cursor is near (for resize cursor + grab)
+        let hit_edge = |pos: Pos2, sel_rect: Rect| -> Option<ResizeEdge> {
+            let near_l = (pos.x - sel_rect.min.x).abs() < grab;
+            let near_r = (pos.x - sel_rect.max.x).abs() < grab;
+            let near_t = (pos.y - sel_rect.min.y).abs() < grab;
+            let near_b = (pos.y - sel_rect.max.y).abs() < grab;
+            let in_x = pos.x >= sel_rect.min.x - grab && pos.x <= sel_rect.max.x + grab;
+            let in_y = pos.y >= sel_rect.min.y - grab && pos.y <= sel_rect.max.y + grab;
+
+            match (near_l && in_y, near_r && in_y, near_t && in_x, near_b && in_x) {
+                (true, _, true, _) => Some(ResizeEdge::TopLeft),
+                (true, _, _, true) => Some(ResizeEdge::BottomLeft),
+                (_, true, true, _) => Some(ResizeEdge::TopRight),
+                (_, true, _, true) => Some(ResizeEdge::BottomRight),
+                (true, _, _, _) => Some(ResizeEdge::Left),
+                (_, true, _, _) => Some(ResizeEdge::Right),
+                (_, _, true, _) => Some(ResizeEdge::Top),
+                (_, _, _, true) => Some(ResizeEdge::Bottom),
+                _ if sel_rect.contains(pos) => Some(ResizeEdge::Move),
+                _ => None,
+            }
+        };
+
+        // Show resize cursors when hovering over selection edges
+        if self.drag_start.is_none() && self.resize_edge.is_none() {
+            if let (Some(sel), Some(hover)) = (&self.selection, response.hover_pos()) {
+                if sel.is_significant() {
+                    if let Some(edge) = hit_edge(hover, sel.rect()) {
+                        let cursor = match edge {
+                            ResizeEdge::TopLeft | ResizeEdge::BottomRight => egui::CursorIcon::ResizeNwSe,
+                            ResizeEdge::TopRight | ResizeEdge::BottomLeft => egui::CursorIcon::ResizeNeSw,
+                            ResizeEdge::Left | ResizeEdge::Right => egui::CursorIcon::ResizeHorizontal,
+                            ResizeEdge::Top | ResizeEdge::Bottom => egui::CursorIcon::ResizeVertical,
+                            ResizeEdge::Move => egui::CursorIcon::Grab,
+                        };
+                        ui.ctx().set_cursor_icon(cursor);
+                    }
+                }
+            }
+        }
+
         if response.dragged_by(egui::PointerButton::Primary) {
             if let Some(pos) = response.interact_pointer_pos() {
                 let clamped = Pos2::new(
                     pos.x.clamp(dest_rect.min.x, dest_rect.max.x),
                     pos.y.clamp(dest_rect.min.y, dest_rect.max.y),
                 );
-                if self.drag_start.is_none() {
-                    self.drag_start = Some(clamped);
+
+                // On drag start, decide: resize existing selection or draw new one
+                if self.drag_start.is_none() && self.resize_edge.is_none() {
+                    if let Some(sel) = &self.selection {
+                        if sel.is_significant() {
+                            if let Some(edge) = hit_edge(clamped, sel.rect()) {
+                                self.resize_edge = Some(edge);
+                                self.resize_origin = Some(sel.rect());
+                                self.drag_start = Some(clamped);
+                            }
+                        }
+                    }
+                    // Not near an edge — start a new selection
+                    if self.resize_edge.is_none() {
+                        self.drag_start = Some(clamped);
+                    }
                 }
-                if let Some(start) = self.drag_start {
-                    self.selection = Some(Selection {
-                        start,
-                        end: clamped,
-                    });
+
+                if let Some(edge) = self.resize_edge {
+                    // Resizing existing selection
+                    if let Some(orig) = self.resize_origin {
+                        let delta = clamped - self.drag_start.unwrap_or(clamped);
+                        let (mut new_min, mut new_max) = (orig.min, orig.max);
+                        match edge {
+                            ResizeEdge::TopLeft => { new_min.x += delta.x; new_min.y += delta.y; }
+                            ResizeEdge::Top => { new_min.y += delta.y; }
+                            ResizeEdge::TopRight => { new_max.x += delta.x; new_min.y += delta.y; }
+                            ResizeEdge::Left => { new_min.x += delta.x; }
+                            ResizeEdge::Right => { new_max.x += delta.x; }
+                            ResizeEdge::BottomLeft => { new_min.x += delta.x; new_max.y += delta.y; }
+                            ResizeEdge::Bottom => { new_max.y += delta.y; }
+                            ResizeEdge::BottomRight => { new_max.x += delta.x; new_max.y += delta.y; }
+                            ResizeEdge::Move => {
+                                let sel_w = orig.width();
+                                let sel_h = orig.height();
+                                let dx = delta.x
+                                    .max(dest_rect.min.x - orig.min.x)
+                                    .min(dest_rect.max.x - orig.max.x);
+                                let dy = delta.y
+                                    .max(dest_rect.min.y - orig.min.y)
+                                    .min(dest_rect.max.y - orig.max.y);
+                                new_min = pos2(orig.min.x + dx, orig.min.y + dy);
+                                new_max = pos2(new_min.x + sel_w, new_min.y + sel_h);
+                            }
+                        }
+                        if edge != ResizeEdge::Move {
+                            new_min.x = new_min.x.clamp(dest_rect.min.x, dest_rect.max.x);
+                            new_min.y = new_min.y.clamp(dest_rect.min.y, dest_rect.max.y);
+                            new_max.x = new_max.x.clamp(dest_rect.min.x, dest_rect.max.x);
+                            new_max.y = new_max.y.clamp(dest_rect.min.y, dest_rect.max.y);
+                        }
+                        // Ensure min < max (swap if inverted)
+                        if new_min.x > new_max.x { std::mem::swap(&mut new_min.x, &mut new_max.x); }
+                        if new_min.y > new_max.y { std::mem::swap(&mut new_min.y, &mut new_max.y); }
+                        self.selection = Some(Selection { start: new_min, end: new_max });
+                    }
+                } else if let Some(start) = self.drag_start {
+                    // Drawing new selection
+                    self.selection = Some(Selection { start, end: clamped });
                 }
             }
         }
 
         if response.drag_stopped_by(egui::PointerButton::Primary) {
             self.drag_start = None;
+            self.resize_edge = None;
+            self.resize_origin = None;
             if let Some(sel) = &self.selection {
                 if !sel.is_significant() {
                     self.selection = None;
@@ -398,10 +510,18 @@ impl ViewerState {
                     0.0, dim,
                 );
 
-                // Magnifying glass when hovering inside selection
+                // Magnifying glass when hovering inside selection (not near edges)
                 if let Some(hover_pos) = response.hover_pos() {
-                    if sel_rect.contains(hover_pos) && self.drag_start.is_none() {
-                        ui.ctx().set_cursor_icon(egui::CursorIcon::ZoomIn);
+                    let interior = Rect::from_min_max(
+                        pos2(sel_rect.min.x + grab, sel_rect.min.y + grab),
+                        pos2(sel_rect.max.x - grab, sel_rect.max.y - grab),
+                    );
+                    if interior.contains(hover_pos) && self.drag_start.is_none() && self.resize_edge.is_none() {
+                        if hit_edge(hover_pos, sel_rect) == Some(ResizeEdge::Move) {
+                            // Resize cursor already set above
+                        } else {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::ZoomIn);
+                        }
 
                         if response.clicked() {
                             zoom_to_sel_requested = true;

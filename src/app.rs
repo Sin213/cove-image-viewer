@@ -1,3 +1,4 @@
+use crate::autocrop;
 use crate::browser::{Browser, SortMode};
 use crate::cache::{CachedImage, ImageCache};
 use crate::decoder::{self, DecodedImage};
@@ -31,8 +32,9 @@ pub struct CoveApp {
     show_image_info: bool,
     confirm_delete: Option<PathBuf>,
     pending_crop: bool,
+    pending_auto_crop: bool,
     pending_undo: bool,
-    undo_stack: Vec<(egui::ColorImage, Vec2)>,
+    undo_stack: Vec<(egui::ColorImage, Vec2, i32, bool, bool)>,
     icon_texture: Option<TextureHandle>,
     tb_press_pos: Option<egui::Pos2>,
     anim_frames: Vec<(egui::ColorImage, u32)>,
@@ -90,6 +92,7 @@ impl CoveApp {
             show_image_info: false,
             confirm_delete: None,
             pending_crop: false,
+            pending_auto_crop: false,
             pending_undo: false,
             undo_stack: Vec::new(),
             icon_texture: None,
@@ -344,7 +347,7 @@ impl CoveApp {
         let ex2 = ((sel.max.x - img_min.x) / self.viewer.zoom).ceil() as usize;
         let ey2 = ((sel.max.y - img_min.y) / self.viewer.zoom).ceil() as usize;
 
-        self.undo_stack.push((pixels.clone(), self.current_image_size));
+        self.undo_stack.push((pixels.clone(), self.current_image_size, self.viewer.rotation, self.viewer.flip_h, self.viewer.flip_v));
 
         let transformed = apply_transform(pixels, self.viewer.rotation, self.viewer.flip_h, self.viewer.flip_v);
         let tw = transformed.width();
@@ -384,15 +387,76 @@ impl CoveApp {
         self.viewer.set_fit_mode(FitMode::FitWindow);
     }
 
+    fn auto_crop(&mut self, ctx: &egui::Context) {
+        let pixels = match &self.current_pixels {
+            Some(p) => p,
+            None => return,
+        };
+
+        let transformed = apply_transform(pixels, self.viewer.rotation, self.viewer.flip_h, self.viewer.flip_v);
+        let opts = autocrop::AutoCropOptions::default();
+        let (cropped, _bounds) = match autocrop::auto_crop_egui(&transformed, &opts) {
+            Some(result) => result,
+            None => return,
+        };
+
+        self.undo_stack.push((pixels.clone(), self.current_image_size, self.viewer.rotation, self.viewer.flip_h, self.viewer.flip_v));
+
+        let size = Vec2::new(cropped.size[0] as f32, cropped.size[1] as f32);
+        let texture = ctx.load_texture("current_image", cropped.clone(), egui::TextureOptions::LINEAR);
+        self.current_texture = Some(texture);
+        self.current_pixels = Some(cropped);
+        self.current_image_size = size;
+        self.viewer.rotation = 0;
+        self.viewer.flip_h = false;
+        self.viewer.flip_v = false;
+        self.viewer.selection = None;
+        self.viewer.set_fit_mode(FitMode::FitWindow);
+    }
+
+    fn batch_auto_crop(&mut self) {
+        let dir = match &self.browser.directory {
+            Some(d) => d.clone(),
+            None => return,
+        };
+        let output_dir = dir.join("cropped");
+        let opts = autocrop::AutoCropOptions::default();
+
+        std::thread::spawn(move || {
+            let results = autocrop::batch_auto_crop(&dir, &output_dir, &opts, false);
+            let mut cropped = 0;
+            let mut errors = 0;
+            for (_, r) in &results {
+                match r {
+                    Ok(_) => cropped += 1,
+                    Err(_) => errors += 1,
+                }
+            }
+            let msg = format!(
+                "Batch auto crop: {} images cropped to {}/\n{} errors",
+                cropped,
+                output_dir.display(),
+                errors
+            );
+            // Use native notification if available, otherwise just log
+            if let Err(_) = std::process::Command::new("notify-send")
+                .args(["Cove", &msg])
+                .spawn()
+            {
+                eprintln!("{}", msg);
+            }
+        });
+    }
+
     fn undo_crop(&mut self, ctx: &egui::Context) {
-        if let Some((pixels, size)) = self.undo_stack.pop() {
+        if let Some((pixels, size, rotation, flip_h, flip_v)) = self.undo_stack.pop() {
             let texture = ctx.load_texture("current_image", pixels.clone(), egui::TextureOptions::LINEAR);
             self.current_texture = Some(texture);
             self.current_pixels = Some(pixels);
             self.current_image_size = size;
-            self.viewer.rotation = 0;
-            self.viewer.flip_h = false;
-            self.viewer.flip_v = false;
+            self.viewer.rotation = rotation;
+            self.viewer.flip_h = flip_h;
+            self.viewer.flip_v = flip_v;
             self.viewer.selection = None;
             self.viewer.set_fit_mode(FitMode::FitWindow);
         }
@@ -458,6 +522,7 @@ impl CoveApp {
         let mut open_dialog = false;
         let mut zoom_out = false;
         let mut crop_to_selection = false;
+        let mut auto_crop = false;
         let mut copy_to_clip = false;
         let mut delete_file = false;
         let mut undo = false;
@@ -500,6 +565,9 @@ impl CoveApp {
             }
             if i.modifiers.ctrl && i.key_pressed(egui::Key::Y) {
                 crop_to_selection = true;
+            }
+            if i.modifiers.ctrl && i.key_pressed(egui::Key::T) {
+                auto_crop = true;
             }
             if i.modifiers.ctrl && i.key_pressed(egui::Key::C) {
                 copy_to_clip = true;
@@ -548,6 +616,9 @@ impl CoveApp {
         }
         if crop_to_selection {
             self.crop_to_selection(ctx);
+        }
+        if auto_crop {
+            self.auto_crop(ctx);
         }
         if undo {
             self.undo_crop(ctx);
@@ -802,8 +873,12 @@ impl CoveApp {
                     ui.separator();
                     let has_sel = self.viewer.selection.as_ref().map(|s| s.is_significant()).unwrap_or(false);
                     if ui.add_enabled(has_sel, egui::Button::new("Crop Selection   Ctrl+Y")).clicked() {
-                        // Can't call crop_to_selection here (needs ctx), so set flag
                         self.pending_crop = true;
+                        ui.close_menu();
+                    }
+                    let has_image = self.current_pixels.is_some();
+                    if ui.add_enabled(has_image, egui::Button::new("Auto Crop        Ctrl+T")).clicked() {
+                        self.pending_auto_crop = true;
                         ui.close_menu();
                     }
                     if ui.add_enabled(has_sel, egui::Button::new("Zoom to Selection")).clicked() {
@@ -812,6 +887,12 @@ impl CoveApp {
                     }
                     if ui.button("Clear Selection     Esc").clicked() {
                         self.viewer.clear_selection();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    let has_dir = self.browser.directory.is_some();
+                    if ui.add_enabled(has_dir, egui::Button::new("Batch Auto Crop")).clicked() {
+                        self.batch_auto_crop();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -1633,6 +1714,10 @@ impl eframe::App for CoveApp {
         if self.pending_crop {
             self.pending_crop = false;
             self.crop_to_selection(ctx);
+        }
+        if self.pending_auto_crop {
+            self.pending_auto_crop = false;
+            self.auto_crop(ctx);
         }
         if self.pending_undo {
             self.pending_undo = false;
