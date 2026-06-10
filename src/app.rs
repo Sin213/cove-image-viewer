@@ -347,8 +347,6 @@ impl CoveApp {
         let ex2 = ((sel.max.x - img_min.x) / self.viewer.zoom).ceil() as usize;
         let ey2 = ((sel.max.y - img_min.y) / self.viewer.zoom).ceil() as usize;
 
-        self.undo_stack.push((pixels.clone(), self.current_image_size, self.viewer.rotation, self.viewer.flip_h, self.viewer.flip_v));
-
         let transformed = apply_transform(pixels, self.viewer.rotation, self.viewer.flip_h, self.viewer.flip_v);
         let tw = transformed.width();
         let th = transformed.height();
@@ -363,6 +361,8 @@ impl CoveApp {
         if cw == 0 || ch == 0 {
             return;
         }
+
+        self.undo_stack.push((pixels.clone(), self.current_image_size, self.viewer.rotation, self.viewer.flip_h, self.viewer.flip_v));
 
         let mut cropped_pixels = Vec::with_capacity(cw * ch);
         for y in y1..y2 {
@@ -740,7 +740,7 @@ impl CoveApp {
                     ui.painter().text(
                         egui::pos2(title_center.x, title_center.y),
                         egui::Align2::CENTER_CENTER,
-                        "Cove Image Viewer v1.0.0",
+                        "Cove Image Viewer v1.1.0",
                         egui::FontId::proportional(12.0),
                         theme::TEXT_DIM,
                     );
@@ -1553,7 +1553,7 @@ impl CoveApp {
                                 let (pill_rect, _) = ui.allocate_exact_size(egui::vec2(pill_w, pill_h), egui::Sense::hover());
                                 ui.painter().rect_filled(pill_rect, 12.0, theme::ACCENT_SOFT);
                                 ui.painter().rect_stroke(pill_rect, 12.0, egui::Stroke::new(1.0, theme::ACCENT_RING), egui::StrokeKind::Outside);
-                                ui.painter().text(pill_rect.center(), egui::Align2::CENTER_CENTER, "Version 1.0.0", egui::FontId::proportional(11.5), theme::ACCENT);
+                                ui.painter().text(pill_rect.center(), egui::Align2::CENTER_CENTER, "Version 1.1.0", egui::FontId::proportional(11.5), theme::ACCENT);
 
                                 ui.add_space(8.0);
                                 ui.label(egui::RichText::new("\u{201C}The VLC of image viewers.\u{201D}").italics().size(13.0));
@@ -1700,7 +1700,7 @@ impl eframe::App for CoveApp {
         }
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-            "Cove Image Viewer v1.0.0".to_string(),
+            "Cove Image Viewer v1.1.0".to_string(),
         ));
 
         self.draw_titlebar(ctx);

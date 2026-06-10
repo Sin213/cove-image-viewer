@@ -314,14 +314,19 @@ impl ViewerState {
 
         // Detect which edge/corner the cursor is near (for resize cursor + grab)
         let hit_edge = |pos: Pos2, sel_rect: Rect| -> Option<ResizeEdge> {
-            let near_l = (pos.x - sel_rect.min.x).abs() < grab;
-            let near_r = (pos.x - sel_rect.max.x).abs() < grab;
-            let near_t = (pos.y - sel_rect.min.y).abs() < grab;
-            let near_b = (pos.y - sel_rect.max.y).abs() < grab;
+            let dl = (pos.x - sel_rect.min.x).abs();
+            let dr = (pos.x - sel_rect.max.x).abs();
+            let dt = (pos.y - sel_rect.min.y).abs();
+            let db = (pos.y - sel_rect.max.y).abs();
             let in_x = pos.x >= sel_rect.min.x - grab && pos.x <= sel_rect.max.x + grab;
             let in_y = pos.y >= sel_rect.min.y - grab && pos.y <= sel_rect.max.y + grab;
+            // For narrow selections, prefer the closer edge
+            let near_l = dl < grab && (dl <= dr || dr >= grab) && in_y;
+            let near_r = dr < grab && (dr < dl || dl >= grab) && in_y;
+            let near_t = dt < grab && (dt <= db || db >= grab) && in_x;
+            let near_b = db < grab && (db < dt || dt >= grab) && in_x;
 
-            match (near_l && in_y, near_r && in_y, near_t && in_x, near_b && in_x) {
+            match (near_l, near_r, near_t, near_b) {
                 (true, _, true, _) => Some(ResizeEdge::TopLeft),
                 (true, _, _, true) => Some(ResizeEdge::BottomLeft),
                 (_, true, true, _) => Some(ResizeEdge::TopRight),
@@ -341,13 +346,15 @@ impl ViewerState {
                 if sel.is_significant() {
                     if let Some(edge) = hit_edge(hover, sel.rect()) {
                         let cursor = match edge {
-                            ResizeEdge::TopLeft | ResizeEdge::BottomRight => egui::CursorIcon::ResizeNwSe,
-                            ResizeEdge::TopRight | ResizeEdge::BottomLeft => egui::CursorIcon::ResizeNeSw,
-                            ResizeEdge::Left | ResizeEdge::Right => egui::CursorIcon::ResizeHorizontal,
-                            ResizeEdge::Top | ResizeEdge::Bottom => egui::CursorIcon::ResizeVertical,
-                            ResizeEdge::Move => egui::CursorIcon::Grab,
+                            ResizeEdge::TopLeft | ResizeEdge::BottomRight => Some(egui::CursorIcon::ResizeNwSe),
+                            ResizeEdge::TopRight | ResizeEdge::BottomLeft => Some(egui::CursorIcon::ResizeNeSw),
+                            ResizeEdge::Left | ResizeEdge::Right => Some(egui::CursorIcon::ResizeHorizontal),
+                            ResizeEdge::Top | ResizeEdge::Bottom => Some(egui::CursorIcon::ResizeVertical),
+                            ResizeEdge::Move => None, // ZoomIn set below
                         };
-                        ui.ctx().set_cursor_icon(cursor);
+                        if let Some(c) = cursor {
+                            ui.ctx().set_cursor_icon(c);
+                        }
                     }
                 }
             }
@@ -510,19 +517,12 @@ impl ViewerState {
                     0.0, dim,
                 );
 
-                // Magnifying glass when hovering inside selection (not near edges)
+                // Magnifying glass + click-to-zoom inside selection interior (not near edges)
                 if let Some(hover_pos) = response.hover_pos() {
-                    let interior = Rect::from_min_max(
-                        pos2(sel_rect.min.x + grab, sel_rect.min.y + grab),
-                        pos2(sel_rect.max.x - grab, sel_rect.max.y - grab),
-                    );
-                    if interior.contains(hover_pos) && self.drag_start.is_none() && self.resize_edge.is_none() {
-                        if hit_edge(hover_pos, sel_rect) == Some(ResizeEdge::Move) {
-                            // Resize cursor already set above
-                        } else {
-                            ui.ctx().set_cursor_icon(egui::CursorIcon::ZoomIn);
-                        }
-
+                    if self.drag_start.is_none() && self.resize_edge.is_none()
+                        && hit_edge(hover_pos, sel_rect) == Some(ResizeEdge::Move)
+                    {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ZoomIn);
                         if response.clicked() {
                             zoom_to_sel_requested = true;
                         }

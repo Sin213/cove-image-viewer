@@ -67,7 +67,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
-            .with_title("Cove Image Viewer v1.0.0")
+            .with_title("Cove Image Viewer v1.1.0")
             .with_icon(icon)
             .with_decorations(false)
             .with_drag_and_drop(true),
@@ -88,15 +88,20 @@ fn run_auto_crop(input: PathBuf, output: Option<PathBuf>, tolerance: u8, padding
     let opts = autocrop::AutoCropOptions { tolerance, padding };
 
     if input.is_file() {
+        let fname = match input.file_name() {
+            Some(f) => f,
+            None => { eprintln!("invalid input path: {}", input.display()); return false; }
+        };
         let out = match output {
             Some(dir) => {
                 if !dry_run {
                     let _ = std::fs::create_dir_all(&dir);
                 }
-                dir.join(input.file_name().unwrap())
+                dir.join(fname)
             }
             None => {
-                let stem = input.file_stem().unwrap().to_string_lossy();
+                let stem = fname.to_string_lossy();
+                let stem = stem.rsplit_once('.').map(|(s, _)| s).unwrap_or(&stem);
                 let ext = input.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_else(|| "png".into());
                 input.with_file_name(format!("{}_cropped.{}", stem, ext))
             }
