@@ -3,6 +3,7 @@ mod autocrop;
 mod browser;
 mod cache;
 mod decoder;
+mod portable;
 mod theme;
 mod viewer;
 
