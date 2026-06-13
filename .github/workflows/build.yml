@@ -48,7 +48,7 @@ jobs:
 
           cat > deb/DEBIAN/control << CONTROL
           Package: cove-image-viewer
-          Version: 1.1.0
+          Version: 1.2.0
           Section: graphics
           Priority: optional
           Architecture: amd64
@@ -58,7 +58,7 @@ jobs:
            Fast cross-platform image viewer with 60+ format support.
           CONTROL
 
-          dpkg-deb --build deb cove-image-viewer_1.1.0_amd64.deb
+          dpkg-deb --build deb cove-image-viewer_1.2.0_amd64.deb
 
       - name: Create AppImage
         run: |
@@ -103,7 +103,7 @@ jobs:
           name: linux-packages
           path: |
             target/release/cove-image-viewer
-            cove-image-viewer_1.1.0_amd64.deb
+            cove-image-viewer_1.2.0_amd64.deb
             Cove_Image_Viewer-x86_64.AppImage
 
   build-windows:
@@ -127,7 +127,7 @@ jobs:
           cat > setup.iss << 'ISS'
           [Setup]
           AppName=Cove Image Viewer
-          AppVersion=1.1.0
+          AppVersion=1.2.0
           AppPublisher=Sin
           DefaultDirName={autopf}\Cove Image Viewer
           DefaultGroupName=Cove Image Viewer
@@ -150,9 +150,6 @@ jobs:
           [Run]
           Filename: "{app}\cove-image-viewer.exe"; Description: "Launch Cove Image Viewer"; Flags: nowait postinstall skipifsilent
           ISS
-
-          # Convert PNG to ICO for the installer
-          magick docs/cove_icon.png -resize 256x256 docs/cove_icon.ico 2>/dev/null || true
 
           # Build installer (iscc is pre-installed on windows-latest)
           iscc setup.iss || echo "Inno Setup not available, skipping installer"
@@ -209,9 +206,9 @@ jobs:
               <key>CFBundleIdentifier</key>
               <string>com.cove.image-viewer</string>
               <key>CFBundleVersion</key>
-              <string>1.1.0</string>
+              <string>1.2.0</string>
               <key>CFBundleShortVersionString</key>
-              <string>1.1.0</string>
+              <string>1.2.0</string>
               <key>CFBundleExecutable</key>
               <string>cove-image-viewer</string>
               <key>CFBundleIconFile</key>
@@ -253,7 +250,7 @@ jobs:
 
           # Linux
           cp artifacts/linux-packages/target/release/cove-image-viewer release/cove-image-viewer-linux-x86_64
-          cp artifacts/linux-packages/cove-image-viewer_1.1.0_amd64.deb release/
+          cp artifacts/linux-packages/cove-image-viewer_1.2.0_amd64.deb release/
           cp artifacts/linux-packages/Cove_Image_Viewer-x86_64.AppImage release/
 
           # Windows

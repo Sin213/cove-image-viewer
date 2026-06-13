@@ -6,7 +6,8 @@ use crate::theme;
 use crate::viewer::{FitMode, ViewerState};
 use egui::{TextureHandle, Vec2};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::panic;
 
 pub struct CoveApp {
@@ -53,6 +54,7 @@ pub struct CoveApp {
     compare_mode: bool,
     loading_path: Option<PathBuf>,
     load_generation: u64,
+    cancel_token: Arc<AtomicBool>,
     inflight_paths: Vec<PathBuf>,
     load_tx: mpsc::Sender<LoadComplete>,
     load_rx: mpsc::Receiver<LoadComplete>,
@@ -113,10 +115,11 @@ impl CoveApp {
             compare_mode: false,
             loading_path: None,
             load_generation: 0,
+            cancel_token: Arc::new(AtomicBool::new(false)),
             inflight_paths: Vec::new(),
             load_tx,
             load_rx,
-            image_cache: ImageCache::new(20),
+            image_cache: ImageCache::new(),
         };
 
         if let Some(p) = path {
@@ -145,13 +148,16 @@ impl CoveApp {
             return;
         }
 
+        self.cancel_token.store(true, Ordering::Relaxed);
+        self.cancel_token = Arc::new(AtomicBool::new(false));
         self.load_generation += 1;
         let gen = self.load_generation;
         self.loading_path = Some(path.clone());
         self.inflight_paths.push(path.clone());
         let tx = self.load_tx.clone();
+        let cancel = self.cancel_token.clone();
         std::thread::spawn(move || {
-            let result = decode_to_cached(&path);
+            let result = decode_to_cached(&path, Some(&cancel));
             let _ = tx.send(LoadComplete { path, file_size, generation: gen, result });
         });
     }
@@ -217,10 +223,13 @@ impl CoveApp {
             return;
         }
         let idx = self.browser.index;
-        let next_idx = if idx + 1 < total { idx + 1 } else { 0 };
-        let prev_idx = if idx > 0 { idx - 1 } else { total - 1 };
+        let offsets: &[isize] = &[1, -1, 2, -2, 3, -3];
 
-        for &i in &[next_idx, prev_idx] {
+        for &offset in offsets {
+            if self.inflight_paths.len() >= 4 {
+                break;
+            }
+            let i = ((idx as isize + offset).rem_euclid(total as isize)) as usize;
             if i == idx {
                 continue;
             }
@@ -232,7 +241,7 @@ impl CoveApp {
             let tx = self.load_tx.clone();
             std::thread::spawn(move || {
                 let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                let result = decode_to_cached(&path);
+                let result = decode_to_cached(&path, None);
                 let _ = tx.send(LoadComplete { path, file_size, generation: 0, result });
             });
         }
@@ -1238,6 +1247,9 @@ impl CoveApp {
                     if zoom_sel {
                         self.viewer.zoom_to_selection(self.current_image_size, self.canvas_rect);
                     }
+                } else if self.loading_path.is_some() {
+                    self.canvas_rect = ui.available_rect_before_wrap();
+                    Self::draw_spinner(ui, &self.loading_path);
                 } else if let Some((_, msg)) = &self.error {
                     ui.centered_and_justified(|ui| {
                         ui.colored_label(theme::DANGER, format!("Failed to load: {msg}"));
@@ -1595,6 +1607,44 @@ impl CoveApp {
             }
         }
     }
+
+    fn draw_spinner(ui: &mut egui::Ui, loading_path: &Option<PathBuf>) {
+        let rect = ui.available_rect_before_wrap();
+        let center = rect.center();
+        let painter = ui.painter();
+        let time = ui.input(|i| i.time);
+
+        let radius = 16.0;
+        let stroke = egui::Stroke::new(2.5, theme::ACCENT);
+        let start_angle = (time * 3.0) as f32;
+        let arc_len = std::f32::consts::PI * 1.2;
+        let n_points = 32;
+        let points: Vec<egui::Pos2> = (0..=n_points)
+            .map(|i| {
+                let angle = start_angle + arc_len * (i as f32 / n_points as f32);
+                egui::pos2(
+                    center.x + radius * angle.cos(),
+                    center.y - 20.0 + radius * angle.sin(),
+                )
+            })
+            .collect();
+        painter.add(egui::Shape::line(points, stroke));
+
+        if let Some(path) = loading_path {
+            let name = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("loading");
+            painter.text(
+                egui::pos2(center.x, center.y + 12.0),
+                egui::Align2::CENTER_CENTER,
+                name,
+                egui::FontId::proportional(12.0),
+                theme::TEXT_DIM,
+            );
+        }
+
+        ui.allocate_rect(rect, egui::Sense::hover());
+    }
 }
 
 impl eframe::App for CoveApp {
@@ -1620,6 +1670,11 @@ impl eframe::App for CoveApp {
 
         while let Ok(complete) = self.load_rx.try_recv() {
             self.inflight_paths.retain(|p| p != &complete.path);
+            if let Err(ref e) = complete.result {
+                if e == "cancelled" {
+                    continue;
+                }
+            }
             let is_target = self.loading_path.as_ref() == Some(&complete.path)
                 && complete.generation == self.load_generation;
             match complete.result {
@@ -1800,14 +1855,21 @@ fn save_jpeg(pixels: &egui::ColorImage, path: &Path, quality: u8) {
     }
 }
 
-fn decode_to_cached(path: &Path) -> Result<CachedImage, String> {
+fn decode_to_cached(path: &Path, cancel: Option<&AtomicBool>) -> Result<CachedImage, String> {
     panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+            return Err("cancelled".into());
+        }
         if let Some(frames) = decoder::load_animated(path) {
             Ok(CachedImage::Animated(
                 frames.into_iter().map(|f| (f.pixels, f.delay_ms)).collect(),
             ))
         } else {
-            decoder::load_image(path).map(CachedImage::Static)
+            let result = decoder::load_image(path, cancel);
+            if cancel.map_or(false, |c| c.load(Ordering::Relaxed)) {
+                return Err("cancelled".into());
+            }
+            result.map(CachedImage::Static)
         }
     }))
     .unwrap_or_else(|_| Err("decoder panic".into()))

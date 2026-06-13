@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone)]
 pub struct DecodedImage {
@@ -58,43 +59,42 @@ pub fn load_animated(path: &Path) -> Option<Vec<AnimatedFrame>> {
     if out.len() > 1 { Some(out) } else { None }
 }
 
-pub fn load_image(path: &Path) -> Result<DecodedImage, String> {
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel.map_or(false, |c| c.load(Ordering::Relaxed))
+}
+
+pub fn load_image(path: &Path, cancel: Option<&AtomicBool>) -> Result<DecodedImage, String> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())
         .unwrap_or_default();
 
+    if is_cancelled(cancel) {
+        return Err("cancelled".into());
+    }
+
     let result = match ext.as_str() {
-        // HEIF/HEIC/AVIF via libheif
         "heic" | "heif" | "avif" | "hif" => load_heif(path),
-        // SVG via resvg
         "svg" | "svgz" => load_svg(path),
-        // JPEG XL
         "jxl" => load_jxl(path),
-        // Photoshop
         "psd" | "psb" => load_psd(path),
-        // Camera RAW
         "cr2" | "nef" | "arw" | "dng" | "orf" | "rw2" | "raf" | "pef" | "srw" | "mrw"
         | "erf" | "kdc" | "dcr" | "raw" | "3fr" | "ari" | "bay" | "cap" | "crw" | "dcs"
         | "drf" | "fff" | "iiq" | "mos" | "mef" | "nrw" | "ptx" | "pxn" | "r3d" | "rwl"
         | "rwz" | "sr2" | "srf" | "x3f" => load_raw(path),
-        // PCX
         "pcx" => load_pcx_image(path),
-        // JPEG 2000
         "jp2" | "j2k" | "j2c" | "jpx" | "jpf" | "jpm" => load_jp2(path),
-        // XBM (X BitMap)
         "xbm" => load_xbm(path),
-        // XPM (X PixMap)
         "xpm" => load_xpm(path),
-        // SGI (Silicon Graphics Image)
         "sgi" | "rgb" | "rgba" | "bw" | "int" | "inta" => load_sgi(path),
-        // TGA might need manual handling for some edge cases
-        // but image crate handles it, so fall through
         _ => load_via_image_crate(path),
     };
 
-    // Fallback: if specific decoder fails, try image crate by extension, then by content
+    if is_cancelled(cancel) {
+        return Err("cancelled".into());
+    }
+
     match &result {
         Ok(_) => result,
         Err(specific_err) => {

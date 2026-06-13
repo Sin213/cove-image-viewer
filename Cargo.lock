@@ -1075,7 +1075,7 @@ dependencies = [
 
 [[package]]
 name = "cove-image-viewer"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "arboard",
  "byteorder",
@@ -1095,6 +1095,7 @@ dependencies = [
  "tiny-skia",
  "usvg",
  "wallpaper",
+ "winres",
 ]
 
 [[package]]
@@ -5540,6 +5541,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "16cdb3898397cf7f624c294948669beafaeebc5577d5ec53d0afb76633593597"
 dependencies = [
  "winapi",
+]
+
+[[package]]
+name = "winres"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b68db261ef59e9e52806f688020631e987592bd83619edccda9c47d42cde4f6c"
+dependencies = [
+ "toml",
 ]
 
 [[package]]

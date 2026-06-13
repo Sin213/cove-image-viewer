@@ -1,6 +1,6 @@
 [package]
 name = "cove-image-viewer"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 description = "The VLC of image viewers — opens every image"
 
@@ -33,6 +33,9 @@ kamadak-exif = "0.5"
 # Clipboard and OS integration
 arboard = "3"
 wallpaper = "3"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
 
 [features]
 default = []
