@@ -261,7 +261,9 @@ jobs:
           cp artifacts/macos-packages/Cove_Image_Viewer.dmg release/
 
           cd release
-          sha256sum * > checksums-sha256.txt
+          for f in *.exe *.AppImage *.deb *.dmg cove-image-viewer-linux-x86_64; do
+            [ -e "$f" ] && sha256sum "$f" > "$f.sha256"
+          done
 
       - name: Create release
         uses: softprops/action-gh-release@v2
