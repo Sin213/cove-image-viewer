@@ -16,6 +16,9 @@ pub const TEXT_FAINT: Color32 = Color32::from_rgb(107, 107, 128);// #6b6b80
 pub const DANGER: Color32 = Color32::from_rgb(255, 107, 107);   // #ff6b6b
 pub const BORDER: Color32 = Color32::from_rgb(20, 20, 28);
 pub const BORDER_STRONG: Color32 = Color32::from_rgb(30, 30, 40);
+/// Visible outer window edge for the frameless eframe window. ~18% gray so it
+/// shows on the very dark CANVAS_BG without screaming on a light wallpaper.
+pub const WINDOW_EDGE: Color32 = Color32::from_rgb(46, 46, 46);
 pub const ACCENT_SOFT: Color32 = Color32::from_rgb(14, 30, 28);
 pub const ACCENT_RING: Color32 = Color32::from_rgb(28, 80, 72);
 

@@ -1235,7 +1235,7 @@ impl CoveApp {
 
     fn draw_canvas(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE.fill(theme::CANVAS_BG))
+            .frame(egui::Frame::NONE.fill(theme::CANVAS_BG).stroke(egui::Stroke::new(4.0, theme::WINDOW_EDGE)))
             .show(ctx, |ui| {
                 if self.compare_mode {
                     self.draw_compare_canvas(ui);
