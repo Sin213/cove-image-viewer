@@ -34,6 +34,11 @@ kamadak-exif = "0.5"
 arboard = "3"
 wallpaper = "3"
 
+# In-app updater (GitHub releases + sha256 sidecar verification)
+ureq = { version = "2", features = ["json"] }
+serde_json = "1"
+sha2 = "0.10"
+
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"
 

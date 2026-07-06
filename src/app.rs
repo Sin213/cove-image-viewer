@@ -3,6 +3,7 @@ use crate::browser::{Browser, SortMode};
 use crate::cache::{CachedImage, ImageCache};
 use crate::decoder::{self, DecodedImage};
 use crate::theme;
+use crate::updater;
 use crate::viewer::{FitMode, ViewerState};
 use egui::{TextureHandle, Vec2};
 use std::path::{Path, PathBuf};
@@ -59,6 +60,7 @@ pub struct CoveApp {
     load_tx: mpsc::Sender<LoadComplete>,
     load_rx: mpsc::Receiver<LoadComplete>,
     image_cache: ImageCache,
+    updater: updater::Updater,
 }
 
 struct LoadComplete {
@@ -120,6 +122,7 @@ impl CoveApp {
             load_tx,
             load_rx,
             image_cache: ImageCache::new(),
+            updater: updater::Updater::start(),
         };
 
         if let Some(p) = path {
@@ -1147,6 +1150,51 @@ impl CoveApp {
         });
     }
 
+    fn draw_update_banner(&mut self, ctx: &egui::Context) {
+        if self.updater.dismissed {
+            return;
+        }
+        let info = { self.updater.info.lock().unwrap().clone() };
+        let Some(info) = info else { return };
+        let status = { self.updater.status.lock().unwrap().clone() };
+        let busy = status == updater::InstallStatus::Busy;
+
+        egui::TopBottomPanel::top("update_banner")
+            .frame(egui::Frame::new().fill(theme::SURFACE)
+                .inner_margin(egui::Margin::symmetric(12, 6))
+                .stroke(egui::Stroke::new(1.0, theme::BORDER)))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    let mut label = format!(
+                        "Cove Image Viewer v{} is available (you have v{})",
+                        info.latest_version,
+                        env!("CARGO_PKG_VERSION"),
+                    );
+                    if let updater::InstallStatus::Failed(err) = &status {
+                        label.push_str(&format!(" - update failed: {err}"));
+                    }
+                    ui.label(label);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !busy && ui.button("Dismiss").clicked() {
+                            self.updater.dismissed = true;
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("View release")).clicked() {
+                            updater::open_release_page(&info.release_url);
+                        }
+                        if info.can_auto_install {
+                            let text = if busy { "Updating…" } else { "Update now" };
+                            if ui.add_enabled(!busy, egui::Button::new(text)).clicked() {
+                                self.updater.install(&info);
+                            }
+                        }
+                    });
+                });
+            });
+        if busy {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
+    }
+
     fn draw_status_bar(&self, ctx: &egui::Context) {
         if self.fullscreen && !self.show_info {
             return;
@@ -1755,12 +1803,13 @@ impl eframe::App for CoveApp {
         }
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-            "Cove Image Viewer v1.1.0".to_string(),
+            concat!("Cove Image Viewer v", env!("CARGO_PKG_VERSION")).to_string(),
         ));
 
         self.draw_titlebar(ctx);
         self.draw_menu_bar(ctx);
         self.draw_toolbar(ctx);
+        self.draw_update_banner(ctx);
         self.draw_status_bar(ctx);
         self.draw_canvas(ctx);
         self.draw_dialogs(ctx);

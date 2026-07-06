@@ -5,6 +5,7 @@ mod cache;
 mod decoder;
 mod portable;
 mod theme;
+mod updater;
 mod viewer;
 
 use clap::{Parser, Subcommand};

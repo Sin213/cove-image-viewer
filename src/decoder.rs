@@ -1160,7 +1160,7 @@ mod tests {
                 eprintln!("  SKIP {label:>8} — file missing");
                 continue;
             }
-            match load_image(&path) {
+            match load_image(&path, None) {
                 Ok(img) => {
                     assert!(img.original_width > 0 && img.original_height > 0,
                         "{label} decoded but has zero dimensions");

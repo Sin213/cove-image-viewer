@@ -15,6 +15,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
+      # Fleet convention: artifact filenames carry the version
+      # (Cove-Image-Viewer-<version>-x86_64.AppImage). The in-app updater
+      # and Cove Nexus both derive the installed version from the name.
+      - name: Read version from Cargo.toml
+        run: echo "VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_ENV"
+
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -48,7 +54,7 @@ jobs:
 
           cat > deb/DEBIAN/control << CONTROL
           Package: cove-image-viewer
-          Version: 1.2.0
+          Version: ${VERSION}
           Section: graphics
           Priority: optional
           Architecture: amd64
@@ -58,7 +64,7 @@ jobs:
            Fast cross-platform image viewer with 60+ format support.
           CONTROL
 
-          dpkg-deb --build deb cove-image-viewer_1.2.0_amd64.deb
+          dpkg-deb --build deb "cove-image-viewer_${VERSION}_amd64.deb"
 
       - name: Create AppImage
         run: |
@@ -95,7 +101,7 @@ jobs:
           APPRUN
           chmod +x AppDir/AppRun
 
-          ARCH=x86_64 ./appimagetool AppDir Cove_Image_Viewer-x86_64.AppImage
+          ARCH=x86_64 ./appimagetool AppDir "Cove-Image-Viewer-${VERSION}-x86_64.AppImage"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -103,8 +109,8 @@ jobs:
           name: linux-packages
           path: |
             target/release/cove-image-viewer
-            cove-image-viewer_1.2.0_amd64.deb
-            Cove_Image_Viewer-x86_64.AppImage
+            cove-image-viewer_*_amd64.deb
+            Cove-Image-Viewer-*-x86_64.AppImage
 
   build-windows:
     runs-on: windows-latest
@@ -250,8 +256,8 @@ jobs:
 
           # Linux
           cp artifacts/linux-packages/target/release/cove-image-viewer release/cove-image-viewer-linux-x86_64
-          cp artifacts/linux-packages/cove-image-viewer_1.2.0_amd64.deb release/
-          cp artifacts/linux-packages/Cove_Image_Viewer-x86_64.AppImage release/
+          cp artifacts/linux-packages/cove-image-viewer_*_amd64.deb release/
+          cp artifacts/linux-packages/Cove-Image-Viewer-*-x86_64.AppImage release/
 
           # Windows
           cp artifacts/windows-packages/Cove_Image_Viewer_Portable.exe release/ 2>/dev/null || true
