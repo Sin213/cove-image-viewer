@@ -122,23 +122,27 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      - name: Read version from Cargo.toml
+        shell: bash
+        run: echo "VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_ENV"
+
       - name: Create Portable
         shell: bash
         run: |
-          cp target/release/cove-image-viewer.exe "Cove_Image_Viewer_Portable.exe"
+          cp target/release/cove-image-viewer.exe "Cove-Image-Viewer-${VERSION}-Portable.exe"
 
       - name: Create installer with Inno Setup
         shell: bash
         run: |
-          cat > setup.iss << 'ISS'
+          cat > setup.iss << ISS
           [Setup]
           AppName=Cove Image Viewer
-          AppVersion=1.2.0
+          AppVersion=${VERSION}
           AppPublisher=Sin
           DefaultDirName={autopf}\Cove Image Viewer
           DefaultGroupName=Cove Image Viewer
           OutputDir=.
-          OutputBaseFilename=Cove_Image_Viewer_Setup
+          OutputBaseFilename=Cove-Image-Viewer-${VERSION}-Setup
           Compression=lzma2
           SolidCompression=yes
           ArchitecturesInstallIn64BitMode=x64compatible
@@ -165,8 +169,8 @@ jobs:
         with:
           name: windows-packages
           path: |
-            Cove_Image_Viewer_Portable.exe
-            Cove_Image_Viewer_Setup.exe
+            Cove-Image-Viewer-*-Portable.exe
+            Cove-Image-Viewer-*-Setup.exe
 
   build-macos:
     runs-on: macos-latest
@@ -179,6 +183,9 @@ jobs:
 
       - name: Build
         run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Read version from Cargo.toml
+        run: echo "VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_ENV"
 
       - name: Create .app bundle
         run: |
@@ -200,7 +207,7 @@ jobs:
           sips -z 512 512 docs/cove_icon.png --out icon.iconset/icon_512x512.png
           iconutil -c icns icon.iconset -o "Cove Image Viewer.app/Contents/Resources/AppIcon.icns"
 
-          cat > "Cove Image Viewer.app/Contents/Info.plist" << 'PLIST'
+          cat > "Cove Image Viewer.app/Contents/Info.plist" << PLIST
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -212,9 +219,9 @@ jobs:
               <key>CFBundleIdentifier</key>
               <string>com.cove.image-viewer</string>
               <key>CFBundleVersion</key>
-              <string>1.2.0</string>
+              <string>${VERSION}</string>
               <key>CFBundleShortVersionString</key>
-              <string>1.2.0</string>
+              <string>${VERSION}</string>
               <key>CFBundleExecutable</key>
               <string>cove-image-viewer</string>
               <key>CFBundleIconFile</key>
@@ -229,14 +236,14 @@ jobs:
 
       - name: Create DMG
         run: |
-          hdiutil create -volname "Cove Image Viewer" -srcfolder "Cove Image Viewer.app" -ov -format UDZO Cove_Image_Viewer.dmg
+          hdiutil create -volname "Cove Image Viewer" -srcfolder "Cove Image Viewer.app" -ov -format UDZO "Cove-Image-Viewer-${VERSION}.dmg"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: macos-packages
           path: |
-            Cove_Image_Viewer.dmg
+            Cove-Image-Viewer-*.dmg
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -260,11 +267,11 @@ jobs:
           cp artifacts/linux-packages/Cove-Image-Viewer-*-x86_64.AppImage release/
 
           # Windows
-          cp artifacts/windows-packages/Cove_Image_Viewer_Portable.exe release/ 2>/dev/null || true
-          cp artifacts/windows-packages/Cove_Image_Viewer_Setup.exe release/ 2>/dev/null || true
+          cp artifacts/windows-packages/Cove-Image-Viewer-*-Portable.exe release/ 2>/dev/null || true
+          cp artifacts/windows-packages/Cove-Image-Viewer-*-Setup.exe release/ 2>/dev/null || true
 
           # macOS
-          cp artifacts/macos-packages/Cove_Image_Viewer.dmg release/
+          cp artifacts/macos-packages/Cove-Image-Viewer-*.dmg release/
 
           cd release
           for f in *.exe *.AppImage *.deb *.dmg cove-image-viewer-linux-x86_64; do
