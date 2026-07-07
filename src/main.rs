@@ -69,7 +69,7 @@ fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
-            .with_title("Cove Image Viewer v1.1.0")
+            .with_title(format!("Cove Image Viewer v{}", env!("CARGO_PKG_VERSION")))
             .with_icon(icon)
             .with_decorations(false)
             .with_drag_and_drop(true),

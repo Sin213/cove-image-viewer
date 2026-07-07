@@ -752,7 +752,7 @@ impl CoveApp {
                     ui.painter().text(
                         egui::pos2(title_center.x, title_center.y),
                         egui::Align2::CENTER_CENTER,
-                        "Cove Image Viewer v1.1.0",
+                        format!("Cove Image Viewer v{}", env!("CARGO_PKG_VERSION")),
                         egui::FontId::proportional(12.0),
                         theme::TEXT_DIM,
                     );
@@ -1613,7 +1613,7 @@ impl CoveApp {
                                 let (pill_rect, _) = ui.allocate_exact_size(egui::vec2(pill_w, pill_h), egui::Sense::hover());
                                 ui.painter().rect_filled(pill_rect, 12.0, theme::ACCENT_SOFT);
                                 ui.painter().rect_stroke(pill_rect, 12.0, egui::Stroke::new(1.0, theme::ACCENT_RING), egui::StrokeKind::Outside);
-                                ui.painter().text(pill_rect.center(), egui::Align2::CENTER_CENTER, "Version 1.1.0", egui::FontId::proportional(11.5), theme::ACCENT);
+                                ui.painter().text(pill_rect.center(), egui::Align2::CENTER_CENTER, format!("Version {}", env!("CARGO_PKG_VERSION")), egui::FontId::proportional(11.5), theme::ACCENT);
 
                                 ui.add_space(8.0);
                                 ui.label(egui::RichText::new("\u{201C}The VLC of image viewers.\u{201D}").italics().size(13.0));
